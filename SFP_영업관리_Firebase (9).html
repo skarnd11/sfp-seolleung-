@@ -2412,10 +2412,43 @@ function pgMyActivity(el) {
     const rb={'계약완료':'bs','진행중':'bi','거절':'bd','보류':'bw','재접촉예정':'bn'};
     const td=document.createElement('div'); td.className='card';
     td.innerHTML=`<div class="card-hd">내 활동 기록 (${d.length}건)</div>
-        <div class="tw"><table><thead><tr><th>날짜</th><th>유형</th><th>고객명</th><th>결과</th><th>메모</th></tr></thead>
-        <tbody>${d.length?d.map(a=>`<tr><td>${a.date}</td><td><span class="badge bi">${a.type}</span></td><td>${a.client||'-'}</td><td><span class="badge ${rb[a.result]||'bg_'}">${a.result}</span></td><td style="max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${a.note||'-'}</td></tr>`).join(''):'<tr><td colspan="5"><div class="empty"><div class="empty-ico">📋</div><div>기록이 없습니다</div></div></td></tr>'}</tbody>
-        </table></div>`;
+        ${d.length ? d.map(a=>`
+        <div style="padding:12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border);margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">${a.date}</div>
+                    <div style="font-size:13px;font-weight:700;color:var(--ink);margin-bottom:3px">${a.client||'-'} <span class="badge bi" style="font-size:10px">${a.type}</span></div>
+                    <div style="font-size:12px;color:var(--sub);margin-bottom:3px">${a.note||'-'}</div>
+                    <span class="badge ${rb[a.result]||'bg_'}" style="font-size:10px">${a.result}</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">
+                    <button class="btn btn-o btn-sm" onclick="editMyActivity('${a.id}')">수정</button>
+                    <button class="btn btn-d btn-sm" onclick="delMyActivity('${a.id}')">삭제</button>
+                </div>
+            </div>
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">📋</div><div>기록이 없습니다</div></div>`}`;
     el.appendChild(td);
+}
+
+function editMyActivity(id) {
+    const acts = load('sfp_activities');
+    const a = acts.find(a => a.id === id);
+    if (!a) return;
+    const newNote   = prompt('메모 수정:', a.note||'');
+    if (newNote === null) return;
+    const newResult = prompt('결과 수정 (진행중/계약완료/거절/보류/재접촉예정):', a.result||'진행중');
+    if (newResult === null) return;
+    a.note   = newNote.trim();
+    a.result = newResult.trim();
+    save('sfp_activities', acts);
+    goTab('my_activity');
+}
+
+function delMyActivity(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_activities', load('sfp_activities').filter(a => a.id !== id));
+    goTab('my_activity');
 }
 
 function pgMyContract(el) {
@@ -2424,16 +2457,49 @@ function pgMyContract(el) {
     const pb={'종신보험':'bg_','건강보험':'bs','실손보험':'bi','연금보험':'bw'};
     const td=document.createElement('div'); td.className='card';
     td.innerHTML=`<div class="card-hd">내 계약 기록 (${d.length}건)</div>
-        <div class="tw"><table><thead><tr><th>날짜</th><th>고객명</th><th>종류</th><th>상품명</th><th>월보험료</th><th>환산TP</th></tr></thead>
-        <tbody>${d.length?d.map(c=>`<tr>
-            <td>${c.date}</td><td>${c.client}</td>
-            <td><span class="badge ${pb[c.product]||'bn'}">${c.product}</span></td>
-            <td>${c.productName||'-'}</td>
-            <td style="text-align:right;font-weight:700">${fmt(c.premium)}원</td>
-            <td style="text-align:right;font-weight:700;color:var(--gold)">${c.tp||'-'}</td>
-        </tr>`).join(''):'<tr><td colspan="6"><div class="empty"><div class="empty-ico">📝</div><div>기록이 없습니다</div></div></td></tr>'}</tbody>
-        </table></div>`;
+        ${d.length ? d.map(c=>`
+        <div style="padding:12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border);margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">${c.date}</div>
+                    <div style="font-size:13px;font-weight:700;color:var(--ink);margin-bottom:3px">${c.client} <span class="badge ${pb[c.product]||'bn'}" style="font-size:10px">${c.product}</span></div>
+                    <div style="font-size:12px;color:var(--sub);margin-bottom:3px">${c.productName||'-'}</div>
+                    <div style="font-size:12px;font-weight:700">
+                        보험료 <span style="color:var(--navy)">${fmt(c.premium)}원</span>
+                        · 환산TP <span style="color:var(--gold)">${c.tp||'-'}</span>
+                    </div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">
+                    <button class="btn btn-o btn-sm" onclick="editMyContract('${c.id}')">수정</button>
+                    <button class="btn btn-d btn-sm" onclick="delMyContract('${c.id}')">삭제</button>
+                </div>
+            </div>
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">📝</div><div>기록이 없습니다</div></div>`}`;
     el.appendChild(td);
+}
+
+function editMyContract(id) {
+    const cons = load('sfp_contracts');
+    const c = cons.find(c => c.id === id);
+    if (!c) return;
+    const newPremium = prompt('월보험료 수정:', c.premium||'');
+    if (newPremium === null) return;
+    const newTp = prompt('환산TP 수정:', c.tp||'');
+    if (newTp === null) return;
+    const newNote = prompt('메모 수정:', c.note||'');
+    if (newNote === null) return;
+    c.premium = Number(newPremium) || c.premium;
+    c.tp      = Number(newTp) || c.tp;
+    c.note    = newNote.trim();
+    save('sfp_contracts', cons);
+    goTab('my_contract');
+}
+
+function delMyContract(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_contracts', load('sfp_contracts').filter(c => c.id !== id));
+    goTab('my_contract');
 }
 
 // ============================================================
@@ -2761,12 +2827,16 @@ function delRoute(id) {
 // 🗺️ 내 동선 입력 (신인 전용)
 // ============================================================
 function pgMyRoute(el) {
-    const myRoutes = load('sfp_routes')
-        .filter(r => r.userId === currentUser.id)
-        .sort((a,b) => b.date.localeCompare(a.date) || (a.time||'').localeCompare(b.time||''));
-    const todayRoutes = myRoutes.filter(r => r.date === todayStr);
+    const selectedDate = el.dataset.routeDate || todayStr;
+    renderMyRoute(el, selectedDate);
+}
 
-    // 유형별 스타일 매핑
+function renderMyRoute(el, selectedDate) {
+    el.dataset.routeDate = selectedDate;
+    const myRoutes = load('sfp_routes')
+        .filter(r => r.userId === currentUser.id && r.date === selectedDate)
+        .sort((a,b) => (a.time||'').localeCompare(b.time||''));
+
     const typeStyle = {
         '고객미팅': {cls:'rt-meeting', icon:'🤝'},
         '이동':     {cls:'rt-move',    icon:'🚶'},
@@ -2776,11 +2846,12 @@ function pgMyRoute(el) {
     };
 
     el.innerHTML = `
-    <div class="sec-hd"><h2>🗺️ 오늘 일정</h2></div>
+    <div class="sec-hd"><h2>🗺️ 내 일정</h2></div>
     <div class="card">
         <div class="card-hd">➕ 일정 추가</div>
         <div class="grid2">
-            <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="rtDate" class="inp" value="${todayStr}"></div>
+            <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="rtDate" class="inp" value="${selectedDate}"
+                onchange="renderMyRoute(this.closest('[data-route-date]')||document.getElementById('appMain').firstChild, this.value)"></div>
             <div class="fg"><label class="lbl">시간 *</label><input type="time" id="rtTime" class="inp"></div>
             <div class="fg">
                 <label class="lbl">유형 *</label>
@@ -2801,9 +2872,19 @@ function pgMyRoute(el) {
         </div>
         <button class="btn btn-p" onclick="addRoute()">+ 추가</button>
     </div>
+
+    <!-- 날짜 이동 -->
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+        <button class="btn btn-o btn-sm" onclick="moveRouteDate(-1)">◀ 전날</button>
+        <div style="flex:1;text-align:center;font-size:14px;font-weight:700;color:var(--ink)">
+            ${selectedDate === todayStr ? '📍 오늘 ' : ''}${selectedDate}
+        </div>
+        <button class="btn btn-o btn-sm" onclick="moveRouteDate(1)">다음날 ▶</button>
+    </div>
+
     <div class="card">
-        <div class="card-hd">📍 오늘 내 일정 (${todayRoutes.length}건)</div>
-        ${todayRoutes.length ? todayRoutes.map(r => {
+        <div class="card-hd">📍 ${selectedDate} 일정 (${myRoutes.length}건)</div>
+        ${myRoutes.length ? myRoutes.map(r => {
             const isMeeting = r.rtype === '고객미팅';
             const cl = isMeeting ? load('sfp_checklist').find(c => c.routeId === r.id) : null;
             const ts = typeStyle[r.rtype||'고객미팅'] || typeStyle['기타'];
@@ -2818,19 +2899,28 @@ function pgMyRoute(el) {
                     <div class="route-loc">📍 ${r.location}</div>
                     ${r.note?`<div class="route-note">${r.note}</div>`:''}
                 </div>
-                <div style="display:flex;gap:6px;margin-left:8px;flex-shrink:0;align-items:center">
+                <div style="display:flex;gap:6px;margin-left:8px;flex-shrink:0;align-items:center;flex-wrap:wrap;justify-content:flex-end">
                     ${isMeeting ? `
                         <button class="btn btn-sm ${cl?'btn-g':'btn-o'}"
                             onclick="openChecklist('${r.id}','${(r.client||r.location).replace(/'/g,"\\'")}','${r.date}')"
                             style="font-size:11px;padding:5px 10px">
-                            ${cl?'📋 완료':'📋 체크리스트'}
+                            ${cl?'📋 수정':'📋 체크리스트'}
                         </button>` : ''}
                     <button class="btn btn-d btn-sm" onclick="delMyRoute('${r.id}')">삭제</button>
                 </div>
             </div>`;
         }).join('')
-        : `<div class="empty"><div class="empty-ico">🗺️</div><div>오늘 등록된 일정이 없습니다</div></div>`}
+        : `<div class="empty"><div class="empty-ico">🗺️</div><div>${selectedDate} 등록된 일정이 없습니다</div></div>`}
     </div>`;
+}
+
+function moveRouteDate(dir) {
+    const el = document.getElementById('appMain').firstChild;
+    if (!el) return;
+    const cur = new Date(el.dataset.routeDate || todayStr);
+    cur.setDate(cur.getDate() + dir);
+    const newDate = `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`;
+    renderMyRoute(el, newDate);
 }
 
 // 💡 유형이 바뀌면 고객명 필드를 흐리게/선명하게
