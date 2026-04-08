@@ -1,0 +1,3795 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>선릉금융 SFP</title>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+    <script>
+    // ============================================================
+    // 🔥 Firebase 동시 사용 안전 설계
+    //
+    // 핵심 원칙: 컬렉션별 개별 문서 저장
+    //   sfp_users/{id}      = 유저 1명
+    //   sfp_contracts/{id}  = 계약 1건
+    //   ...
+    //
+    // 이렇게 하면 A와 B가 동시에 저장해도 서로 다른 문서에 저장되므로
+    // 절대 덮어쓰기가 발생하지 않음
+    // ============================================================
+    const firebaseConfig = {
+        apiKey: "AIzaSyAVM_wW456LJ0a1IJA7pWDg1dP7205H4OQ",
+        authDomain: "sfp-seolleung.firebaseapp.com",
+        projectId: "sfp-seolleung",
+        storageBucket: "sfp-seolleung.firebasestorage.app",
+        messagingSenderId: "747116418132",
+        appId: "1:747116418132:web:9e24baa72825d8344589c1"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.firestore();
+
+    // 💡 sfp_promos는 이미지 base64 데이터가 커서 초기 로딩에서 제외
+    // 장표관리/자료실 탭 열 때 따로 로드
+    const EAGER_COLLECTIONS = [
+        'sfp_users','sfp_routes','sfp_checklist','sfp_activities',
+        'sfp_contracts','sfp_consents','sfp_calendar',
+        'sfp_quick_comments','sfp_coaching','sfp_feedback','sfp_notices','sfp_messages'
+    ];
+    const LAZY_COLLECTIONS = ['sfp_promos'];
+    const COLLECTIONS = [...EAGER_COLLECTIONS, ...LAZY_COLLECTIONS];
+
+    // 메모리 캐시 (컬렉션명 → 배열)
+    window._cache = {};
+
+    // ── 컬렉션 전체 로드
+    window._fsLoad = (col) => {
+        return db.collection(col).get().then(snap => {
+            window._cache[col] = snap.docs.map(d => d.data());
+        }).catch(() => {
+            window._cache[col] = window._cache[col] || [];
+        });
+    };
+
+    // ── 레코드 1개 저장/업데이트 (id 기준)
+    // 기존 save(key, array) 호출을 그대로 받아서 처리
+    window._fsSave = (col, arr) => {
+        if (!Array.isArray(arr)) return;
+        // 캐시 즉시 업데이트 (화면 반영용)
+        window._cache[col] = arr;
+
+        const batch = db.batch();
+        let batchCount = 0;
+        arr.forEach(item => {
+            if (!item.id) return;
+            const ref = db.collection(col).doc(String(item.id));
+            batch.set(ref, item);
+            batchCount++;
+        });
+        // 삭제된 레코드 처리는 delRec에서 직접 처리하므로 여기선 생략
+        if (batchCount > 0) {
+            batch.commit().catch(e => console.warn('Firestore batch error:', e));
+        }
+    };
+
+    // ── 실시간 리스너 (컬렉션 전체 감지)
+    window._fsListen = (col) => {
+        db.collection(col).onSnapshot(snap => {
+            if (!window._cache[col]) window._cache[col] = [];
+            snap.docChanges().forEach(change => {
+                const data = change.doc.data();
+                if (change.type === 'added' || change.type === 'modified') {
+                    const idx = window._cache[col].findIndex(i => String(i.id) === change.doc.id);
+                    if (idx >= 0) window._cache[col][idx] = data;
+                    else window._cache[col].push(data);
+                } else if (change.type === 'removed') {
+                    window._cache[col] = window._cache[col].filter(i => String(i.id) !== change.doc.id);
+                }
+            });
+
+            if (!window._loggedIn) return;
+
+            // 신인: 자동 재렌더링 (관리자가 수정/삭제해도 바로 반영)
+            // 관리자: 배지만 표시 (자동 재렌더링 시 입력 중이던 폼 초기화 방지)
+            if (currentUser && currentUser.role === 'sfp') {
+                if (window._currentTabId && window._pageMap) {
+                    const fn = window._pageMap[window._currentTabId];
+                    const main = document.getElementById('appMain');
+                    // firstChild가 텍스트 노드일 수 있으므로 firstElementChild 사용
+                    const contentEl = main && (main.firstElementChild || main.firstChild);
+                    if (fn && contentEl) {
+                        fn(contentEl);
+                    }
+                }
+            } else {
+                if (window._newDataKeys) window._newDataKeys.add(col);
+                updateRefreshBadge();
+            }
+        }, e => console.warn('Listener error:', col, e));
+    };
+
+    // firebaseInit은 DOM 로드 후 실행 (body가 없으면 loadingScreen을 못 찾음)
+    window._firebaseReady = false;
+    document.addEventListener('DOMContentLoaded', function() {
+        const loadingEl = document.getElementById('loadingScreen');
+        if (loadingEl) loadingEl.style.display = 'flex';
+
+        function startAppNow() {
+            if (window._started) return;
+            window._started = true;
+            if (loadingEl) loadingEl.style.display = 'none';
+            window._fsInitDone = true;
+            window._appReady = true;
+            if (window._onFirebaseReady) window._onFirebaseReady();
+        }
+
+        // 5초 안에 Firebase 로드 안 되면 강제 시작
+        const timer = setTimeout(startAppNow, 5000);
+
+        Promise.all(EAGER_COLLECTIONS.map(c => window._fsLoad(c)))
+            .then(() => { EAGER_COLLECTIONS.forEach(c => window._fsListen(c)); })
+            .catch(e => console.warn('Firebase 초기화 오류:', e))
+            .finally(() => {
+                clearTimeout(timer);
+                startAppNow();
+            });
+    });
+    </script>
+    <style>
+        /* 로딩 화면 */
+        #loadingScreen {
+            display:flex; position:fixed; inset:0; z-index:9999;
+            background:#03122B; flex-direction:column;
+            align-items:center; justify-content:center; gap:20px;
+        }
+        .loading-logo {
+            width:64px; height:64px; border-radius:18px;
+            background:linear-gradient(145deg,#D4AB4E,#B8922A);
+            display:flex; align-items:center; justify-content:center;
+            font-size:28px; font-weight:900; color:#03122B;
+            animation: pulse 1.2s ease-in-out infinite;
+        }
+        @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.7;transform:scale(.95)} }
+        .loading-text { color:rgba(255,255,255,.6); font-size:14px; font-family:'Noto Sans KR',sans-serif; }
+        .loading-bar { width:180px; height:3px; background:rgba(255,255,255,.12); border-radius:2px; overflow:hidden; }
+        .loading-bar-inner { height:100%; width:40%; background:#B8922A; border-radius:2px; animation:slide 1s ease-in-out infinite; }
+        @keyframes slide { 0%{transform:translateX(-100%)} 100%{transform:translateX(350%)} }
+
+        /* ============================================================
+           🎨 삼성생명 × 모니모 프리미엄 디자인 시스템
+           - 딥 네이비 + 순백 + 금빛 포인트
+           - 절제된 간격, 섬세한 타이포그래피
+           - 모니모(Monimo) 수준의 핀테크 UI
+           ============================================================ */
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700;900&display=swap');
+
+        :root {
+            /* 메인 컬러 */
+            --ink:    #03122B;   /* 최심부 네이비 — 헤더, 강조 텍스트 */
+            --navy:   #0C2461;   /* 삼성생명 메인 블루 */
+            --blue:   #1A56DB;   /* 인터랙션 블루 */
+            --gold:   #B8922A;   /* 삼성생명 골드 */
+            --gold-l: #D4AB4E;   /* 골드 라이트 */
+            --gold-bg:#FBF5E6;   /* 골드 배경 */
+
+            /* 그레이 스케일 */
+            --bg:     #F4F6FA;   /* 페이지 배경 */
+            --surface:#FFFFFF;   /* 카드 배경 */
+            --border: #E8ECF3;   /* 구분선 */
+            --border2:#D1D9E8;   /* 강조 구분선 */
+            --text:   #0D1B34;   /* 본문 */
+            --sub:    #4A5878;   /* 보조 텍스트 */
+            --muted:  #8E9AB5;   /* 약한 텍스트 */
+            --dimmed: #B8C2D6;   /* 비활성 */
+
+            /* 상태 컬러 */
+            --green:  #0E7C4A;
+            --green-l:#E8F7EF;
+            --red:    #C0283A;
+            --red-l:  #FDEEF0;
+            --amber:  #B45309;
+            --amber-l:#FEF3E2;
+            --violet: #4338CA;
+            --violet-l:#EEEDFB;
+
+            /* 반경·그림자 */
+            --r-sm:  8px;
+            --r-md:  14px;
+            --r-lg:  20px;
+            --r-xl:  28px;
+            --sh-sm: 0 1px 4px rgba(3,18,43,.06), 0 2px 12px rgba(3,18,43,.04);
+            --sh-md: 0 2px 8px rgba(3,18,43,.07), 0 6px 24px rgba(3,18,43,.06);
+            --sh-lg: 0 8px 32px rgba(3,18,43,.12), 0 2px 8px rgba(3,18,43,.06);
+        }
+
+        *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+        html { font-size:16px; }
+        body {
+            font-family:'Noto Sans KR', sans-serif;
+            background:var(--bg); color:var(--text);
+            min-height:100vh; -webkit-font-smoothing:antialiased;
+            letter-spacing:-0.01em;
+        }
+        button, input, select, textarea { font-family:inherit; }
+
+        /* ============================================================
+           🔐 로그인 — 딥 네이비 + 절제된 기하학 배경
+           ============================================================ */
+        #loginScreen {
+            min-height:100vh;
+            background: #060E24;
+            display:flex; flex-direction:column;
+            align-items:center; justify-content:center;
+            padding:40px 24px; position:relative; overflow:hidden;
+        }
+        /* 배경 빛 효과 */
+        #loginScreen::before {
+            content:''; position:absolute;
+            width:600px; height:600px; border-radius:50%;
+            background:radial-gradient(circle, rgba(26,86,219,.18) 0%, transparent 70%);
+            top:-100px; left:50%; transform:translateX(-50%);
+            pointer-events:none;
+        }
+        #loginScreen::after {
+            content:''; position:absolute;
+            width:400px; height:400px; border-radius:50%;
+            background:radial-gradient(circle, rgba(184,146,42,.1) 0%, transparent 70%);
+            bottom:-80px; right:-60px;
+            pointer-events:none;
+        }
+        /* 배경 격자 패턴 */
+        .login-grid-bg {
+            position:absolute; inset:0; pointer-events:none;
+            background-image:
+                linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+            background-size:48px 48px;
+        }
+
+        .login-brand { z-index:1; text-align:center; margin-bottom:44px; animation: fadeUp .6s .05s both; }
+        .login-logo-ring {
+            width:72px; height:72px; margin:0 auto 16px;
+            border-radius:22px;
+            background:linear-gradient(145deg, var(--gold-l) 0%, var(--gold) 100%);
+            box-shadow:0 0 0 1px rgba(184,146,42,.3), 0 12px 40px rgba(184,146,42,.28);
+            display:flex; align-items:center; justify-content:center;
+        }
+        .login-logo-inner {
+            width:44px; height:44px; background:var(--ink);
+            border-radius:12px;
+            display:flex; align-items:center; justify-content:center;
+            font-size:22px; font-weight:900; color:var(--gold-l); letter-spacing:-1px;
+        }
+        .login-h1 {
+            font-size:22px; font-weight:700; color:#fff;
+            letter-spacing:-.4px; margin-bottom:5px;
+        }
+        .login-sub {
+            font-size:12px; color:rgba(255,255,255,.4);
+            font-weight:400; letter-spacing:.6px; text-transform:uppercase;
+        }
+
+        .login-card {
+            width:100%; max-width:380px; z-index:1;
+            background:rgba(255,255,255,.055);
+            border:1px solid rgba(255,255,255,.1);
+            backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px);
+            border-radius:var(--r-xl); padding:36px 32px;
+            animation: fadeUp .6s .15s both;
+        }
+        @keyframes fadeUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+
+        .login-toggle {
+            display:flex; background:rgba(255,255,255,.07);
+            border:1px solid rgba(255,255,255,.1);
+            border-radius:var(--r-sm); overflow:hidden; margin-bottom:28px;
+        }
+        .login-toggle button {
+            flex:1; padding:10px 0; border:none; cursor:pointer;
+            font-size:13px; font-weight:600; letter-spacing:-.1px;
+            transition:all .22s; background:transparent; color:rgba(255,255,255,.45);
+            border-radius:var(--r-sm);
+        }
+        .login-toggle button.active { background:var(--gold); color:var(--ink); }
+
+        .login-lbl {
+            display:block; color:rgba(255,255,255,.5);
+            font-size:10.5px; font-weight:700; letter-spacing:.8px;
+            text-transform:uppercase; margin-bottom:8px;
+        }
+        .login-inp {
+            width:100%; padding:13px 16px;
+            background:rgba(255,255,255,.07);
+            border:1.5px solid rgba(255,255,255,.11);
+            border-radius:var(--r-sm); color:#fff; font-size:14.5px;
+            margin-bottom:16px; transition:border-color .2s, background .2s;
+        }
+        .login-inp::placeholder { color:rgba(255,255,255,.25); }
+        .login-inp:focus { outline:none; border-color:var(--gold-l); background:rgba(255,255,255,.11); }
+
+        .login-btn {
+            width:100%; padding:14px; margin-top:4px;
+            background:linear-gradient(135deg, var(--gold-l) 0%, var(--gold) 100%);
+            border:none; border-radius:var(--r-sm); color:var(--ink);
+            font-size:14px; font-weight:800; letter-spacing:.1px;
+            cursor:pointer; transition:all .2s;
+            box-shadow:0 4px 16px rgba(184,146,42,.35);
+        }
+        .login-btn:hover { transform:translateY(-1px); box-shadow:0 8px 24px rgba(184,146,42,.45); }
+        .login-btn:active { transform:none; box-shadow:none; }
+
+        .login-panel { display:none; }
+        .login-panel.on { display:block; }
+        .login-err { color:#FCA5A5; font-size:12.5px; text-align:center; margin-top:12px; min-height:18px; }
+        .login-ok  { color:#6EE7B7; font-size:12.5px; text-align:center; margin-top:12px; }
+        .login-hint {
+            color:rgba(255,255,255,.2); font-size:11px;
+            text-align:center; margin-top:24px; z-index:1; line-height:1.8;
+        }
+
+        /* ============================================================
+           📱 앱 레이아웃
+           ============================================================ */
+        #appWrap { display:none; flex-direction:column; min-height:100vh; }
+        #appWrap.on { display:flex; }
+
+        /* 헤더 — 더 얇고 정제된 라인 */
+        .app-hdr {
+            height:58px; padding:0 20px;
+            background:var(--ink);
+            display:flex; align-items:center; justify-content:space-between;
+            position:sticky; top:0; z-index:300;
+            border-bottom:1px solid rgba(255,255,255,.07);
+        }
+        .hdr-left { display:flex; align-items:center; gap:12px; }
+        .hdr-logo {
+            width:34px; height:34px;
+            background:linear-gradient(145deg, var(--gold-l), var(--gold));
+            border-radius:10px; display:flex; align-items:center; justify-content:center;
+            font-size:17px; font-weight:900; color:var(--ink); flex-shrink:0;
+            box-shadow:0 2px 8px rgba(184,146,42,.3);
+        }
+        .hdr-name { font-size:14px; font-weight:700; color:#fff; line-height:1.2; letter-spacing:-.2px; }
+        .hdr-role { font-size:10.5px; color:rgba(255,255,255,.45); font-weight:400; letter-spacing:.1px; }
+        .logout-btn {
+            background:transparent; border:1px solid rgba(255,255,255,.18);
+            color:rgba(255,255,255,.65); padding:6px 13px; border-radius:var(--r-sm);
+            font-size:12px; font-weight:600; cursor:pointer; white-space:nowrap;
+            transition:all .18s; letter-spacing:-.1px;
+        }
+        .logout-btn:hover { background:rgba(255,255,255,.1); color:#fff; }
+        .refresh-btn {
+            background:transparent; border:1px solid rgba(255,255,255,.18);
+            color:rgba(255,255,255,.65); padding:6px 10px; border-radius:var(--r-sm);
+            font-size:15px; cursor:pointer; position:relative; transition:all .18s;
+        }
+        .refresh-btn:hover { background:rgba(255,255,255,.1); }
+        .refresh-badge { position:absolute; top:-3px; right:-3px; width:9px; height:9px; background:#E53E4D; border-radius:50%; display:none; border:1.5px solid var(--ink); }
+        .refresh-badge.on { display:block; }
+
+        /* 탭 — 하단 진한 선 대신 골드 하이라이트 */
+        .tab-nav {
+            background:var(--surface); height:46px;
+            border-bottom:1px solid var(--border);
+            display:flex; overflow-x:auto; padding:0 8px;
+            position:sticky; top:58px; z-index:299;
+            gap:0;
+        }
+        .tab-nav::-webkit-scrollbar { display:none; }
+        .t-btn {
+            padding:0 16px; height:45px; border:none; background:none;
+            cursor:pointer; color:var(--muted); font-size:12.5px; font-weight:500;
+            white-space:nowrap; border-bottom:2px solid transparent;
+            transition:all .18s; flex-shrink:0; letter-spacing:-.1px;
+        }
+        .t-btn:hover { color:var(--navy); }
+        .t-btn.on { color:var(--navy); border-bottom-color:var(--gold); font-weight:700; }
+
+        .app-main { flex:1; padding:22px 16px 48px; max-width:960px; margin:0 auto; width:100%; }
+
+        /* ============================================================
+           🧩 공통 컴포넌트 — 더 가볍고 정제된 카드
+           ============================================================ */
+        .card {
+            background:var(--surface); border-radius:var(--r-md);
+            padding:22px; box-shadow:var(--sh-sm);
+            border:1px solid var(--border);
+            margin-bottom:14px;
+        }
+        .card-hd {
+            font-size:13px; font-weight:700; color:var(--ink);
+            margin-bottom:18px; display:flex; align-items:center; gap:8px;
+            letter-spacing:-.1px;
+        }
+
+        .fg { display:flex; flex-direction:column; gap:6px; }
+        .fg.full { grid-column:1/-1; }
+        .lbl {
+            font-size:10.5px; font-weight:700; color:var(--muted);
+            text-transform:uppercase; letter-spacing:.6px;
+        }
+        .inp {
+            padding:10px 14px;
+            border:1.5px solid var(--border); border-radius:var(--r-sm);
+            color:var(--text); font-size:13.5px; background:var(--surface);
+            transition:border-color .18s, box-shadow .18s; width:100%;
+        }
+        .inp:focus {
+            outline:none; border-color:var(--blue);
+            box-shadow:0 0 0 3px rgba(26,86,219,.1);
+        }
+        textarea.inp { resize:vertical; }
+
+        .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:16px; }
+
+        /* 버튼 시스템 */
+        .btn {
+            padding:10px 20px; border:none; border-radius:var(--r-sm);
+            font-size:13px; font-weight:700; cursor:pointer;
+            transition:all .18s; display:inline-flex; align-items:center;
+            gap:7px; letter-spacing:-.1px; white-space:nowrap;
+        }
+        .btn-p {
+            background:var(--navy); color:#fff;
+            box-shadow:0 2px 8px rgba(12,36,97,.2);
+        }
+        .btn-p:hover { background:#0A1E58; transform:translateY(-1px); box-shadow:0 4px 16px rgba(12,36,97,.3); }
+        .btn-g {
+            background:linear-gradient(135deg,var(--gold-l),var(--gold));
+            color:var(--ink); box-shadow:0 2px 8px rgba(184,146,42,.25);
+        }
+        .btn-g:hover { transform:translateY(-1px); box-shadow:0 4px 16px rgba(184,146,42,.35); }
+        .btn-d {
+            background:transparent; color:var(--red);
+            border:1px solid rgba(192,40,58,.3); padding:6px 12px; font-size:12px;
+        }
+        .btn-d:hover { background:var(--red-l); border-color:var(--red); }
+        .btn-o { background:transparent; color:var(--navy); border:1.5px solid var(--border2); }
+        .btn-o:hover { background:var(--bg); border-color:var(--navy); }
+        .btn-w {
+            background:rgba(255,255,255,.12); color:#fff;
+            border:1px solid rgba(255,255,255,.2);
+        }
+        .btn-w:hover { background:rgba(255,255,255,.22); }
+        .btn-sm { padding:6px 12px; font-size:11.5px; }
+
+        /* ============================================================
+           📊 통계 카드 — 모니모 스타일 넘버 카드
+           ============================================================ */
+        .stat-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin-bottom:16px; }
+        @media(min-width:580px){ .stat-grid { grid-template-columns:repeat(4,1fr); } }
+        .stat-card {
+            background:var(--surface); border-radius:var(--r-md);
+            padding:18px 16px; box-shadow:var(--sh-sm);
+            border:1px solid var(--border); position:relative; overflow:hidden;
+        }
+        .stat-card::after {
+            content:''; position:absolute; top:0; left:0; right:0; height:3px;
+            background:var(--accent-color, var(--gold));
+            border-radius:var(--r-md) var(--r-md) 0 0;
+        }
+        .stat-lbl { font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+        .stat-v { font-weight:800; color:var(--ink); margin:6px 0 2px; line-height:1.1; }
+
+        /* 진행 바 */
+        .prog-bg { background:#EBF0F8; border-radius:6px; height:6px; overflow:hidden; }
+        .prog { height:100%; border-radius:6px; transition:width .5s cubic-bezier(.4,0,.2,1); }
+        .pg { background:linear-gradient(90deg,#0E7C4A,#12A862); }
+        .pm { background:linear-gradient(90deg,#B45309,#D97706); }
+        .pl { background:linear-gradient(90deg,#C0283A,#E53E4D); }
+
+        /* ============================================================
+           🗂️ 테이블
+           ============================================================ */
+        .tw { overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:var(--r-sm); }
+        table { width:100%; border-collapse:collapse; font-size:13px; }
+        th {
+            background:#F7F9FC; color:var(--muted);
+            font-weight:700; font-size:10.5px; padding:11px 14px;
+            text-align:left; border-bottom:1px solid var(--border);
+            white-space:nowrap; letter-spacing:.3px; text-transform:uppercase;
+        }
+        td { padding:12px 14px; border-bottom:1px solid var(--border); vertical-align:middle; }
+        tr:last-child td { border-bottom:none; }
+        tr:hover td { background:#F9FAFD; }
+
+        /* ============================================================
+           🏷️ 배지 시스템
+           ============================================================ */
+        .badge {
+            display:inline-flex; align-items:center;
+            padding:3px 9px; border-radius:20px;
+            font-size:11px; font-weight:700; letter-spacing:-.1px;
+        }
+        .bs { background:var(--green-l); color:var(--green); }
+        .bw { background:var(--amber-l); color:var(--amber); }
+        .bi { background:#E8F0FE; color:#1A56DB; }
+        .bd { background:var(--red-l); color:var(--red); }
+        .bg_ { background:var(--gold-bg); color:var(--gold); }
+        .bn { background:var(--violet-l); color:var(--violet); }
+
+        /* ============================================================
+           👤 신인 카드 — 정제된 프로필 카드
+           ============================================================ */
+        .sfp-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(215px,1fr)); gap:14px; }
+        .sfp-c {
+            background:var(--surface); border-radius:var(--r-md);
+            padding:20px; box-shadow:var(--sh-sm); border:1px solid var(--border);
+            position:relative; overflow:hidden;
+        }
+        .sfp-c::before {
+            content:''; position:absolute; top:0; left:0; right:0; height:3px;
+            background:linear-gradient(90deg, var(--gold-l), var(--gold));
+        }
+        .sfp-cn {
+            font-size:14px; font-weight:700; color:var(--ink);
+            margin-bottom:14px; display:flex; align-items:center; gap:8px;
+        }
+        .sfp-avatar {
+            width:30px; height:30px; border-radius:9px;
+            background:linear-gradient(135deg,var(--navy),#1A56DB);
+            display:inline-flex; align-items:center; justify-content:center;
+            font-size:13px; color:#fff; font-weight:800; flex-shrink:0;
+        }
+        .sfp-r { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:8px; }
+        .sfp-r strong { color:var(--ink); font-weight:700; }
+
+        /* ============================================================
+           🗂️ 섹션 헤더
+           ============================================================ */
+        .sec-hd { display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
+        .sec-hd h2 { font-size:18px; font-weight:800; color:var(--ink); letter-spacing:-.4px; }
+
+        /* 필터 바 */
+        .fbar { display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
+        .fbar .inp { max-width:148px; font-size:12px; padding:7px 11px; }
+
+        /* 빈 상태 */
+        .empty { text-align:center; padding:52px 20px; color:var(--dimmed); }
+        .empty-ico { font-size:36px; margin-bottom:12px; opacity:.7; }
+        .empty p { font-size:13px; font-weight:500; }
+
+        /* ============================================================
+           📅 달력 — 클린 미니멀
+           ============================================================ */
+        .cal-wrap { background:var(--surface); border-radius:var(--r-md); overflow:hidden; box-shadow:var(--sh-sm); border:1px solid var(--border); margin-bottom:14px; touch-action:pan-y; }
+        .cal-hdr { background:var(--ink); color:#fff; padding:14px 16px; display:flex; align-items:center; justify-content:space-between; }
+        .cal-hdr-title { font-size:15px; font-weight:700; letter-spacing:-.3px; }
+        .cal-nav {
+            background:rgba(255,255,255,.1); border:none; color:rgba(255,255,255,.9);
+            width:32px; height:32px; border-radius:var(--r-sm); cursor:pointer;
+            font-size:16px; display:flex; align-items:center; justify-content:center;
+            transition:background .15s; -webkit-tap-highlight-color:transparent;
+        }
+        .cal-nav:hover { background:rgba(255,255,255,.22); }
+        .cal-days-hdr { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); border-bottom:1px solid var(--border); }
+        .cal-day-name { text-align:center; padding:8px 2px; font-size:11px; font-weight:700; color:var(--muted); }
+        .cal-day-name:first-child { color:var(--red); }
+        .cal-day-name:last-child { color:var(--blue); }
+        .cal-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); }
+        .cal-cell {
+            min-height:52px; border-right:1px solid var(--border); border-bottom:1px solid var(--border);
+            padding:4px 3px; cursor:pointer; transition:background .13s; position:relative;
+            overflow:hidden; min-width:0;
+            -webkit-tap-highlight-color:transparent;
+        }
+        @media (min-width:400px) { .cal-cell { min-height:64px; padding:6px 5px; } }
+        .cal-cell:hover { background:#F5F8FF; }
+        .cal-cell.today { background:#FDFBF4; }
+        .cal-cell.empty { background:#FAFBFC; cursor:default; }
+        .cal-num {
+            font-size:11px; font-weight:600; color:var(--sub);
+            width:20px; height:20px; display:flex; align-items:center; justify-content:center;
+            margin-bottom:2px; border-radius:50%;
+        }
+        @media (min-width:400px) { .cal-num { font-size:12.5px; width:24px; height:24px; } }
+        .cal-cell.today .cal-num { background:var(--gold); color:var(--ink); font-weight:800; }
+        .cal-cell:nth-child(7n+1) .cal-num { color:var(--red); }
+        .cal-cell:nth-child(7n) .cal-num { color:var(--blue); }
+        .cal-evt {
+            font-size:8.5px; font-weight:600; padding:1px 3px; border-radius:3px;
+            margin-bottom:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+            display:block; max-width:100%; box-sizing:border-box;
+        }
+        @media (min-width:400px) { .cal-evt { font-size:9.5px; padding:2px 5px; border-radius:4px; margin-bottom:2px; } }
+        .cal-evt.type-일정 { background:#E8F0FE; color:#1A56DB; }
+        .cal-evt.type-마감 { background:var(--red-l); color:var(--red); }
+        .cal-evt.type-행사 { background:var(--amber-l); color:var(--amber); }
+        .cal-evt.type-공지 { background:var(--green-l); color:var(--green); }
+        .cal-evt.type-교육 { background:#EDE9FE; color:#5B21B6; }
+        .cal-evt.type-기타 { background:var(--border); color:var(--sub); }
+        .more-evt { font-size:8px; color:var(--muted); font-weight:600; }
+        /* 스와이프 힌트 */
+        .cal-swipe-hint { text-align:center; font-size:11px; color:var(--muted); padding:6px 0 2px; }
+
+        /* 이벤트 모달 */
+        .evt-modal-overlay { display:none; position:fixed; inset:0; background:rgba(3,18,43,.7); z-index:500; align-items:flex-end; justify-content:center; }
+        .evt-modal-overlay.on { display:flex; }
+        @media(min-width:500px){ .evt-modal-overlay { align-items:center; } }
+        .evt-modal { background:var(--surface); border-radius:var(--r-lg) var(--r-lg) 0 0; width:100%; max-width:480px; padding:28px; max-height:80vh; overflow-y:auto; }
+        @media(min-width:500px){ .evt-modal { border-radius:var(--r-lg); } }
+        .evt-modal-hd { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
+        .evt-date-badge { font-size:14px; font-weight:800; color:var(--ink); letter-spacing:-.3px; }
+        .evt-list { margin-bottom:16px; }
+        .evt-item { display:flex; align-items:center; gap:12px; padding:12px 14px; border-radius:var(--r-sm); background:var(--bg); margin-bottom:8px; border:1px solid var(--border); }
+        .evt-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+        .evt-item-text { flex:1; font-size:13px; font-weight:600; color:var(--text); }
+        .evt-item-time { font-size:11px; color:var(--muted); font-weight:500; }
+
+        /* ============================================================
+           🗺️ 동선
+           ============================================================ */
+        .route-date-hdr { font-size:12px; font-weight:700; color:var(--muted); padding:8px 0 8px; border-bottom:1px solid var(--border); margin-bottom:10px; text-transform:uppercase; letter-spacing:.5px; }
+        .route-row { display:flex; align-items:center; gap:10px; padding:11px 14px; background:var(--bg); border-radius:var(--r-sm); margin-bottom:7px; border:1px solid var(--border); }
+        .route-time { font-size:12px; font-weight:700; color:var(--gold); min-width:50px; background:var(--gold-bg); padding:4px 8px; border-radius:6px; text-align:center; }
+        .route-loc { font-size:13px; color:var(--text); flex:1; font-weight:500; }
+        .route-note { font-size:11px; color:var(--muted); }
+
+        /* ============================================================
+           📎 파일 업로드
+           ============================================================ */
+        .upload-zone {
+            border:2px dashed var(--border2); border-radius:var(--r-md); padding:32px 20px;
+            text-align:center; cursor:pointer; transition:all .2s; background:var(--bg);
+        }
+        .upload-zone:hover, .upload-zone.drag { border-color:var(--gold); background:var(--gold-bg); }
+        #fileInput { display:none; }
+        .file-prev { margin-top:12px; font-size:13px; font-weight:700; color:var(--navy); }
+
+        /* 장표 그리드 */
+        .promo-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:14px; }
+        .promo-c {
+            background:var(--surface); border-radius:var(--r-md); overflow:hidden;
+            box-shadow:var(--sh-sm); border:1px solid var(--border); cursor:pointer;
+            transition:transform .2s, box-shadow .2s;
+        }
+        .promo-c:hover { transform:translateY(-3px); box-shadow:var(--sh-lg); }
+        .promo-thumb { width:100%; height:128px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#EEF2F8; }
+        .promo-thumb img { width:100%; height:128px; object-fit:cover; }
+        .promo-pdf-ico { font-size:46px; background:linear-gradient(135deg,var(--gold-bg),#FAF0CD); width:100%; height:128px; display:flex; align-items:center; justify-content:center; }
+        .promo-info { padding:13px; }
+        .promo-cat { font-size:10px; font-weight:700; color:var(--gold); text-transform:uppercase; letter-spacing:.5px; margin-bottom:5px; }
+        .promo-title { font-size:12.5px; font-weight:700; color:var(--ink); margin-bottom:3px; line-height:1.35; }
+        .promo-period { font-size:11px; color:var(--muted); }
+
+        /* ============================================================
+           🪟 모달 (범용)
+           ============================================================ */
+        .overlay { display:none; position:fixed; inset:0; background:rgba(3,18,43,.72); z-index:998; align-items:center; justify-content:center; padding:16px; }
+        .overlay.on { display:flex; }
+        .modal { background:var(--surface); border-radius:var(--r-lg); width:100%; max-width:620px; max-height:90vh; overflow:auto; box-shadow:var(--sh-lg); border:1px solid var(--border); }
+        .modal-hd { padding:22px 22px 0; display:flex; justify-content:space-between; align-items:center; }
+        .modal-hd h3 { font-size:15px; font-weight:800; color:var(--ink); letter-spacing:-.3px; }
+        .modal-x { background:none; border:none; font-size:22px; color:var(--muted); cursor:pointer; line-height:1; width:30px; height:30px; display:flex; align-items:center; justify-content:center; border-radius:50%; transition:background .15s; }
+        .modal-x:hover { background:var(--bg); color:var(--ink); }
+        .modal-body { padding:22px; }
+
+        /* ===== 공지 배너 ===== */
+        .notice-banner {
+            background: linear-gradient(135deg, var(--navy) 0%, #1A3A6B 100%);
+            color: #fff; padding: 11px 18px;
+            display: flex; align-items: center; gap: 12px;
+            position: sticky; top: 104px; z-index: 198;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            animation: slideDown .35s ease both;
+        }
+        @keyframes slideDown { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:translateY(0)} }
+        .notice-banner-icon { font-size: 16px; flex-shrink:0; }
+        .notice-banner-text { font-size: 13px; font-weight: 600; flex: 1; letter-spacing: -.1px; }
+        .notice-banner-close {
+            background: rgba(255,255,255,.15); border: none; color: rgba(255,255,255,.8);
+            width: 24px; height: 24px; border-radius: 50%; cursor: pointer;
+            font-size: 14px; display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0; transition: background .15s;
+        }
+        .notice-banner-close:hover { background: rgba(255,255,255,.28); }
+
+        /* ===== 공지 팝업 모달 ===== */
+        .notice-modal-wrap {
+            display:none; position:fixed; inset:0; z-index:9000;
+            background:rgba(0,0,0,.6); backdrop-filter:blur(4px);
+            align-items:center; justify-content:center; padding:20px;
+        }
+        .notice-modal-wrap.on { display:flex; }
+        .notice-modal {
+            background:#fff; border-radius:20px; width:100%; max-width:420px;
+            overflow:hidden; animation:popIn .3s cubic-bezier(.34,1.56,.64,1) both;
+            box-shadow:0 20px 60px rgba(0,0,0,.3);
+        }
+        @keyframes popIn { from{opacity:0;transform:scale(.85)} to{opacity:1;transform:scale(1)} }
+        .notice-modal-header {
+            background:linear-gradient(135deg,#03122B,#0C2461);
+            padding:24px 24px 20px; color:#fff; position:relative;
+        }
+        .notice-modal-badge {
+            display:inline-flex; align-items:center; gap:6px;
+            background:rgba(255,255,255,.15); border-radius:20px;
+            padding:4px 12px; font-size:12px; font-weight:700; margin-bottom:12px;
+        }
+        .notice-modal-title { font-size:20px; font-weight:900; line-height:1.4; }
+        .notice-modal-date { font-size:11px; color:rgba(255,255,255,.5); margin-top:6px; }
+        .notice-modal-body { padding:24px; }
+        .notice-modal-content {
+            font-size:14px; line-height:1.8; color:#0D1B34;
+            white-space:pre-wrap; margin-bottom:20px;
+        }
+        .notice-modal-footer { display:flex; gap:10px; }
+        .notice-modal-footer button { flex:1; padding:13px; border-radius:10px; border:none; cursor:pointer; font-size:14px; font-weight:700; font-family:inherit; }
+        .notice-modal-later { background:#F0F2F8; color:#8E9AB5; }
+        .notice-modal-confirm { background:#0C2461; color:#fff; }
+
+        /* 공지 목록 (관리자) */
+        .notice-item {
+            padding:16px; border:1px solid var(--border); border-radius:var(--r-sm);
+            margin-bottom:10px; background:var(--bg);
+        }
+        .notice-item-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:8px; }
+        .notice-item-title { font-size:14px; font-weight:800; color:var(--ink); }
+        .notice-item-date { font-size:11px; color:var(--muted); }
+        .notice-item-body { font-size:13px; color:var(--sub); line-height:1.6; white-space:pre-wrap; }
+
+        /* ===== 쪽지 ===== */
+        .msg-bubble { border-radius:12px; padding:12px 16px; margin-bottom:10px; max-width:88%; }
+        .msg-bubble.sent { background:var(--navy); color:#fff; margin-left:auto; border-bottom-right-radius:4px; }
+        .msg-bubble.recv { background:var(--bg); border:1px solid var(--border); border-bottom-left-radius:4px; }
+        .msg-meta { font-size:10px; margin-top:6px; opacity:.6; }
+        .msg-bubble.sent .msg-meta { text-align:right; }
+        .msg-text { font-size:13px; line-height:1.6; white-space:pre-wrap; }
+        .msg-bubble.sent .msg-text { color:#fff; }
+        .msg-bubble.recv .msg-text { color:var(--ink); }
+        .msg-reply-bubble { background:var(--goldBg,#FBF5E6); border:1px solid rgba(184,146,42,.2); border-radius:10px; padding:10px 14px; margin-bottom:6px; }
+        .msg-reply-text { font-size:12px; color:var(--gold); line-height:1.5; white-space:pre-wrap; }
+        .msg-reply-meta { font-size:10px; color:var(--muted); margin-top:4px; }
+        .msg-unread { display:inline-block; width:8px; height:8px; background:#E53E4D; border-radius:50%; margin-left:6px; vertical-align:middle; }
+
+        /* ===== 피드백 ===== */
+        .fb-box {
+            background: var(--gold-bg); border: 1px solid rgba(184,146,42,.25);
+            border-radius: var(--r-sm); padding: 10px 14px; margin-top: 8px;
+            display: flex; align-items: flex-start; gap: 10px;
+        }
+        .fb-avatar {
+            width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
+            background: linear-gradient(135deg, var(--gold-l), var(--gold));
+            display: flex; align-items: center; justify-content: center;
+            font-size: 13px; font-weight: 800; color: var(--ink);
+        }
+        .fb-content { flex: 1; }
+        .fb-meta { font-size: 10.5px; color: var(--muted); font-weight: 600; margin-bottom: 3px; }
+        .fb-text { font-size: 13px; color: var(--text); line-height: 1.55; }
+        .fb-form { display: flex; gap: 8px; margin-top: 10px; }
+        .fb-inp {
+            flex: 1; padding: 8px 12px; border: 1.5px solid var(--border);
+            border-radius: var(--r-sm); font-size: 13px; color: var(--text);
+            background: var(--surface); font-family: inherit;
+        }
+        .fb-inp:focus { outline: none; border-color: var(--gold); }
+
+        /* ===== 주간요약 ===== */
+        .week-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px,1fr)); gap: 10px; margin-bottom: 16px; }
+        .week-stat {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r-sm); padding: 14px 12px; text-align: center;
+        }
+        .week-stat-v { font-size: 22px; font-weight: 900; color: var(--navy); line-height: 1; }
+        .week-stat-l { font-size: 10.5px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .4px; margin-top: 5px; }
+        .sfp-week-row {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 14px; border-radius: var(--r-sm);
+            background: var(--bg); border: 1px solid var(--border); margin-bottom: 8px;
+        }
+        .sfp-week-name { font-size: 13px; font-weight: 700; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+        .sfp-week-nums { display: flex; gap: 16px; }
+        .sfp-week-num { text-align: center; }
+        .sfp-week-num-v { font-size: 15px; font-weight: 800; color: var(--navy); }
+        .sfp-week-num-l { font-size: 10px; color: var(--muted); font-weight: 600; }
+
+        /* ===== 코칭노트 ===== */
+        .coaching-card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r-md); padding: 20px; margin-bottom: 12px;
+        }
+        .coaching-hd { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+        .coaching-avatar {
+            width: 38px; height: 38px; border-radius: 11px; flex-shrink: 0;
+            background: linear-gradient(135deg, var(--navy), var(--blue));
+            display: flex; align-items: center; justify-content: center;
+            font-size: 16px; color: #fff; font-weight: 800;
+        }
+        .coaching-name { font-size: 15px; font-weight: 800; color: var(--ink); }
+        .coaching-join { font-size: 11px; color: var(--muted); margin-top: 1px; }
+        .note-item {
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: var(--r-sm); padding: 12px 14px; margin-bottom: 8px;
+        }
+        .note-item-hd { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+        .note-month { font-size: 11px; font-weight: 700; color: var(--gold); background: var(--gold-bg); padding: 2px 8px; border-radius: 12px; }
+        .note-text { font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
+        .note-add-form { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+
+        /* ===== 체크리스트 모달 ===== */
+        .cl-modal-overlay { display:none; position:fixed; inset:0; background:rgba(3,18,43,.72); z-index:600; align-items:flex-end; justify-content:center; }
+        .cl-modal-overlay.on { display:flex; }
+        @media(min-width:540px){ .cl-modal-overlay { align-items:center; } }
+        .cl-modal { background:var(--surface); border-radius:var(--r-lg) var(--r-lg) 0 0; width:100%; max-width:520px; max-height:88vh; overflow-y:auto; }
+        @media(min-width:540px){ .cl-modal { border-radius:var(--r-lg); } }
+        .cl-modal-hd { padding:22px 22px 0; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); padding-bottom:16px; }
+        .cl-modal-title { font-size:15px; font-weight:800; color:var(--ink); }
+        .cl-modal-sub { font-size:11px; color:var(--muted); font-weight:500; margin-top:2px; }
+        .cl-modal-body { padding:20px 22px 28px; }
+        .cl-section { margin-bottom:20px; }
+        .cl-section-title { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:10px; }
+        .cl-chips { display:flex; flex-wrap:wrap; gap:7px; }
+        .cl-chip {
+            padding:7px 14px; border-radius:20px; border:1.5px solid var(--border);
+            font-size:13px; font-weight:600; color:var(--sub); cursor:pointer;
+            background:var(--surface); transition:all .15s; user-select:none;
+        }
+        .cl-chip:hover { border-color:var(--navy); color:var(--navy); }
+        .cl-chip.sel { background:var(--navy); color:#fff; border-color:var(--navy); }
+        .cl-chip.sel-gold { background:var(--gold); color:var(--ink); border-color:var(--gold); }
+        .cl-chip.sel-green { background:var(--green); color:#fff; border-color:var(--green); }
+        .cl-chip.sel-red { background:var(--red); color:#fff; border-color:var(--red); }
+        .cl-divider { height:1px; background:var(--border); margin:18px 0; }
+
+        /* 체크리스트 결과 카드 */
+        .cl-result {
+            background:var(--bg); border:1px solid var(--border);
+            border-radius:var(--r-sm); padding:12px 14px; margin-top:8px;
+        }
+        .cl-result-hd { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; margin-bottom:8px; }
+        .cl-tag { display:inline-flex; align-items:center; padding:3px 9px; border-radius:12px; font-size:11px; font-weight:700; margin:2px 3px 2px 0; }
+
+        /* 코칭 빠른 코멘트 */
+        .quick-comment {
+            background:var(--surface); border:1px solid var(--border);
+            border-radius:var(--r-sm); padding:11px 14px; margin-bottom:7px;
+            position:relative;
+        }
+        .qc-meta { font-size:10.5px; color:var(--muted); font-weight:600; margin-bottom:4px; display:flex; justify-content:space-between; }
+        .qc-text { font-size:13px; color:var(--text); line-height:1.55; }
+        .qc-del { background:none; border:none; color:var(--dimmed); cursor:pointer; font-size:15px; padding:0; line-height:1; }
+        .qc-del:hover { color:var(--red); }
+        .qc-form { display:flex; gap:8px; margin-top:10px; }
+        .qc-inp { flex:1; padding:9px 13px; border:1.5px solid var(--border); border-radius:var(--r-sm); font-size:13px; color:var(--text); background:var(--surface); font-family:inherit; transition:border-color .18s; }
+        .qc-inp:focus { outline:none; border-color:var(--navy); }
+
+        /* 코칭카드 탭 */
+        .coaching-tabs { display:flex; gap:0; border:1px solid var(--border); border-radius:var(--r-sm); overflow:hidden; margin-bottom:16px; }
+        .coaching-tab { flex:1; padding:9px 0; border:none; cursor:pointer; font-size:12.5px; font-weight:600; transition:all .18s; background:var(--bg); color:var(--muted); font-family:inherit; }
+        .coaching-tab.on { background:var(--navy); color:#fff; }
+
+        .route-type { display:inline-flex; align-items:center; padding:3px 9px; border-radius:12px; font-size:11px; font-weight:700; margin-bottom:3px; }
+        .rt-meeting  { background:#E8F0FE; color:#1A56DB; }
+        .rt-move     { background:#F3F4F6; color:#6B7280; }
+        .rt-edu      { background:#FEF3C7; color:#92400E; }
+        .rt-internal { background:#EDE9FE; color:#5B21B6; }
+        .rt-etc      { background:#F3F4F6; color:#6B7280; }
+
+        /* ===== 고객명 입력란 조건부 표시 ===== */
+        .client-field { transition: opacity .2s; }
+        .client-field.hidden { opacity:.35; pointer-events:none; }
+
+        /* ============================================================
+           📱 반응형
+           ============================================================ */
+        @media(max-width:480px){
+            .app-main { padding:16px 12px 40px; }
+            .stat-grid { grid-template-columns:repeat(2,1fr); gap:10px; }
+            .grid2 { grid-template-columns:1fr; }
+            .login-card { padding:28px 22px; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- 로딩 화면 (Firebase 데이터 로드 중) -->
+<!-- 공지 팝업 모달 -->
+<div class="notice-modal-wrap" id="noticeModal">
+    <div class="notice-modal">
+        <div class="notice-modal-header">
+            <div class="notice-modal-badge">📢 공지사항</div>
+            <div class="notice-modal-title" id="noticeModalTitle"></div>
+            <div class="notice-modal-date" id="noticeModalDate"></div>
+        </div>
+        <div class="notice-modal-body">
+            <div class="notice-modal-content" id="noticeModalContent"></div>
+            <div class="notice-modal-footer">
+                <button class="notice-modal-later" onclick="closeNoticeModal(false)">나중에 보기</button>
+                <button class="notice-modal-confirm" onclick="closeNoticeModal(true)">✅ 확인했습니다</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="loadingScreen">
+    <div class="loading-logo">S</div>
+    <div class="loading-text">선릉금융 SFP 불러오는 중...</div>
+    <div class="loading-bar"><div class="loading-bar-inner"></div></div>
+</div>
+
+<!-- ================================================
+     🔐 로그인 화면
+     
+     💡 [코딩 개념 1: HTML 구조]
+     - <div>: 박스(컨테이너) 역할
+     - id="loginScreen": 이 박스의 고유 이름표
+     - JavaScript에서 이 이름으로 요소를 찾아 제어
+     ================================================ -->
+<div id="loginScreen">
+    <div class="login-grid-bg"></div>
+    <div class="login-brand">
+        <div class="login-logo-ring">
+            <div class="login-logo-inner">SL</div>
+        </div>
+        <h1 class="login-h1">선릉금융 SFP</h1>
+        <p class="login-sub">Samsung Life · Seolleung FP</p>
+    </div>
+    <div class="login-card">
+        <!-- 로그인 / 회원가입 탭 토글 -->
+        <div class="login-toggle">
+            <button id="tabLogin" class="active" onclick="switchAuthTab('login')">로그인</button>
+            <button id="tabRegister" onclick="switchAuthTab('register')">계정 만들기</button>
+        </div>
+
+        <!-- 로그인 패널 -->
+        <div id="panelLogin" class="login-panel on">
+            <label class="login-lbl">이름</label>
+            <input type="text" id="loginName" class="login-inp" placeholder="이름을 입력하세요" autocomplete="name">
+            <label class="login-lbl">비밀번호</label>
+            <input type="password" id="loginPw" class="login-inp" placeholder="비밀번호를 입력하세요"
+                   onkeydown="if(event.key==='Enter') doLogin()">
+            <button class="login-btn" onclick="doLogin()">로그인</button>
+            <div id="loginErr" class="login-err"></div>
+        </div>
+
+        <!-- 회원가입 패널 -->
+        <div id="panelRegister" class="login-panel">
+            <label class="login-lbl">이름 *</label>
+            <input type="text" id="regName" class="login-inp" placeholder="본인 이름 입력">
+            <label class="login-lbl">비밀번호 *</label>
+            <input type="password" id="regPw" class="login-inp" placeholder="비밀번호 설정">
+            <label class="login-lbl">비밀번호 확인 *</label>
+            <input type="password" id="regPw2" class="login-inp" placeholder="비밀번호 재입력"
+                   onkeydown="if(event.key==='Enter') doRegister()">
+            <button class="login-btn" onclick="doRegister()">계정 만들기</button>
+            <div id="regErr" class="login-err"></div>
+            <div id="regOk" class="login-ok"></div>
+        </div>
+    </div>
+    <div class="login-hint">선릉금융 SFP · Samsung Life Seolleung FP</div>
+</div>
+
+<!-- ================================================
+     📱 메인 앱 화면 (로그인 후 표시)
+     
+     💡 왜 처음엔 display:none일까?
+     - 로그인 전엔 숨겨두고
+     - 로그인 성공 시 JavaScript로 보이게 전환
+     ================================================ -->
+<div id="appWrap" class="app-wrap">
+    <header class="app-hdr">
+        <div class="hdr-left">
+            <div class="hdr-logo">S</div>
+            <div>
+                <div id="hdrName" class="hdr-name"></div>
+                <div id="hdrRole" class="hdr-role"></div>
+            </div>
+        </div>
+        <button class="refresh-btn" onclick="manualRefresh()" title="새로고침">
+            🔄<span class="refresh-badge" id="refreshBadge"></span>
+        </button>
+        <button class="logout-btn" onclick="doLogout()">로그아웃</button>
+    </header>
+    <nav class="tab-nav" id="tabNav"></nav>
+    <!-- ② 공지 배너: 관리자가 등록한 최신 공지를 여기에 표시 -->
+    <div id="noticeBanner" style="display:none"></div>
+    <main class="app-main" id="appMain"></main>
+</div>
+
+<!-- 파일 뷰어 모달 -->
+<div class="overlay" id="viewerModal">
+    <div class="modal">
+        <div class="modal-hd">
+            <h3 id="viewerTitle"></h3>
+            <button class="modal-x" onclick="closeViewer()">×</button>
+        </div>
+        <div class="modal-body" id="viewerBody"></div>
+    </div>
+</div>
+
+<!-- 체크리스트 모달 -->
+<div class="cl-modal-overlay" id="clModal">
+    <div class="cl-modal">
+        <div class="cl-modal-hd">
+            <div>
+                <div class="cl-modal-title">📋 미팅 체크리스트</div>
+                <div class="cl-modal-sub" id="clModalSub"></div>
+            </div>
+            <button class="modal-x" onclick="closeChecklist()">×</button>
+        </div>
+        <div class="cl-modal-body" id="clModalBody"></div>
+    </div>
+</div>
+
+<script>
+// ============================================================
+// 🔄 수동 새로고침 — Firebase에서 최신 데이터 다시 로드 후 현재 탭 렌더링
+// 자동 재렌더링 대신 사용자가 🔄 버튼으로 직접 새로고침
+// ============================================================
+window._newDataKeys = new Set();
+
+function updateRefreshBadge() {
+    const badge = document.getElementById('refreshBadge');
+    if (badge && window._newDataKeys && window._newDataKeys.size > 0) {
+        badge.classList.add('on');
+    }
+}
+
+function manualRefresh() {
+    const badge = document.getElementById('refreshBadge');
+    if (badge) badge.classList.remove('on');
+    if (window._newDataKeys) window._newDataKeys.clear();
+    // 현재 탭 재렌더링
+    if (window._currentTabId && window._pageMap) {
+        const fn = window._pageMap[window._currentTabId];
+        const main = document.getElementById('appMain');
+        if (fn && main) {
+            main.innerHTML = '';
+            const wrap = document.createElement('div');
+            main.appendChild(wrap);
+            fn(wrap);
+        }
+    }
+}
+//
+// 💡 동작 원리:
+// - window._cache: 메모리 캐시 (Firebase에서 로드한 데이터)
+// - load(key): 캐시에서 즉시 읽기 (동기)
+// - save(key, data): 캐시 즉시 업데이트 + Firestore에 비동기 저장
+// - 실시간 리스너: 다른 기기가 저장하면 캐시 자동 업데이트
+// ============================================================
+const load = k => (window._cache && window._cache[k]) ? window._cache[k] : [];
+const save = (k, v) => {
+    if (!window._cache) window._cache = {};
+    window._cache[k] = v;
+    if (window._fsSave) window._fsSave(k, v);
+};
+const genId   = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
+const fmt     = n => Number(n||0).toLocaleString('ko-KR');
+
+const today     = new Date();
+const thisYM    = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}`;
+// 💡 toISOString()은 UTC 기준이라 한국(UTC+9)에서 날짜가 밀림 → 로컬 기준으로 수정
+const todayStr  = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+
+// ============================================================
+// 💡 [코딩 개념 3: 변수 - 현재 상태 관리]
+//
+// currentUser = 지금 로그인한 사람의 정보를 담는 변수
+// - null: 아무도 로그인 안 한 상태
+// - 로그인 성공 시 → {id, name, role, target, ...} 저장
+// ============================================================
+let currentUser = null;
+let pendingFile = null; // 업로드 대기 중인 파일
+
+// ============================================================
+// 🏗️ 앱 최초 실행 시 기본 데이터 생성
+//
+// 💡 왜 이게 필요할까?
+// - 처음 파일을 열면 localStorage가 비어있음
+// - 관리자 계정이 없으면 아무도 로그인 불가
+// - 그래서 기본 관리자 계정을 자동 생성
+// ============================================================
+function initApp() {
+    // 💡 중요: Firebase에서 이미 로드된 데이터가 있으면 절대 덮어쓰지 않음
+    // 캐시가 비어있는 것처럼 보여도 Firebase에 실제 데이터가 있을 수 있음
+    // → _fsInitDone 플래그로 Firebase 로드 완료 후에만 초기화 여부 판단
+    const users = load('sfp_users');
+    if (!users.length && window._fsInitDone) {
+        // Firebase에도 진짜 없는 경우에만 관리자 계정 생성
+        save('sfp_users', [{
+            id: 'admin_root',
+            name: '관리자',
+            password: 'admin1234',
+            role: 'admin',
+            joinDate: '',
+            target: 0
+        }]);
+    }
+}
+
+// ============================================================
+// 🔀 로그인 ↔ 회원가입 탭 전환
+//
+// 💡 classList.toggle : 클래스 붙이고 떼는 방법
+// - .on 클래스가 있으면 → display:block (보임)
+// - .on 클래스가 없으면 → display:none  (숨김)
+// ============================================================
+function switchAuthTab(tab) {
+    document.getElementById('panelLogin').classList.toggle('on', tab === 'login');
+    document.getElementById('panelRegister').classList.toggle('on', tab === 'register');
+    document.getElementById('tabLogin').classList.toggle('active', tab === 'login');
+    document.getElementById('tabRegister').classList.toggle('active', tab === 'register');
+    document.getElementById('loginErr').textContent = '';
+    document.getElementById('regErr').textContent = '';
+    document.getElementById('regOk').textContent = '';
+}
+
+// ============================================================
+// 🆕 회원가입
+//
+// 💡 핵심 로직:
+// 1. 이름 중복 체크 → 같은 이름 있으면 막기
+// 2. 비밀번호 확인 → 두 입력이 같은지 비교
+// 3. 통과하면 role:'sfp' 로 자동 등록
+// 4. 바로 로그인 탭으로 이동
+// ============================================================
+function doRegister() {
+    const name = document.getElementById('regName').value.trim();
+    const pw   = document.getElementById('regPw').value;
+    const pw2  = document.getElementById('regPw2').value;
+
+    if (!name)         return regErr('이름을 입력해주세요');
+    if (!pw)           return regErr('비밀번호를 입력해주세요');
+    if (pw.length < 4) return regErr('비밀번호는 4자 이상이어야 합니다');
+    if (pw !== pw2)    return regErr('비밀번호가 일치하지 않습니다');
+
+    const btn = document.querySelector('#panelRegister .login-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '처리 중...'; }
+
+    // Firestore에서 이름 중복 직접 확인 후 개별 문서로 저장
+    db.collection('sfp_users').where('name', '==', name).get().then(snap => {
+        if (!snap.empty) {
+            if (btn) { btn.disabled = false; btn.textContent = '계정 만들기'; }
+            return regErr('이미 사용 중인 이름입니다');
+        }
+        const newUser = {
+            id: genId(), name, password: pw, role: 'sfp',
+            joinDate: todayStr, target: 0, targetTp: 0, targetAct: 0
+        };
+        // 개별 문서로 저장 → 다른 사람 데이터와 절대 충돌 없음
+        return db.collection('sfp_users').doc(newUser.id).set(newUser).then(() => {
+            if (!window._cache['sfp_users']) window._cache['sfp_users'] = [];
+            window._cache['sfp_users'].push(newUser);
+
+            document.getElementById('regErr').textContent = '';
+            document.getElementById('regOk').textContent = `✅ ${name}님 계정이 생성되었습니다! 로그인해주세요`;
+            ['regName','regPw','regPw2'].forEach(id => { document.getElementById(id).value = ''; });
+            if (btn) { btn.disabled = false; btn.textContent = '계정 만들기'; }
+            setTimeout(() => {
+                switchAuthTab('login');
+                document.getElementById('loginName').value = name;
+            }, 1500);
+        });
+    }).catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = '계정 만들기'; }
+        regErr('네트워크 오류가 발생했습니다. 다시 시도해주세요');
+    });
+}
+
+function regErr(msg) {
+    document.getElementById('regErr').textContent = msg;
+}
+
+// ============================================================
+// 🔐 로그인/로그아웃
+//
+// 💡 동작 원리:
+// 1. users 배열에서 이름이 같은 사람 찾기 (Array.find)
+// 2. 비밀번호도 일치하는지 확인
+// 3. 맞으면 currentUser에 저장 후 앱 화면 전환
+// ============================================================
+function doLogin() {
+    const name = document.getElementById('loginName').value.trim();
+    const pw   = document.getElementById('loginPw').value;
+    if (!name || !pw) { loginErr('이름과 비밀번호를 입력해주세요'); return; }
+
+    const btn = document.querySelector('#panelLogin .login-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '로그인 중...'; }
+
+    // Firestore에서 직접 이름 조회 → 캐시 타이밍 문제 없음
+    db.collection('sfp_users').where('name', '==', name).get().then(snap => {
+        if (btn) { btn.disabled = false; btn.textContent = '로그인'; }
+        if (snap.empty) { loginErr('이름 또는 비밀번호가 올바르지 않습니다'); return; }
+
+        const user = snap.docs[0].data();
+        if (user.password !== pw) { loginErr('이름 또는 비밀번호가 올바르지 않습니다'); return; }
+
+        // 캐시 최신화
+        if (!window._cache['sfp_users']) window._cache['sfp_users'] = [];
+        const idx = window._cache['sfp_users'].findIndex(u => u.id === user.id);
+        if (idx >= 0) window._cache['sfp_users'][idx] = user;
+        else window._cache['sfp_users'].push(user);
+
+        currentUser = user;
+        window._loggedIn = true;
+        document.getElementById('loginScreen').style.display = 'none';
+        document.getElementById('appWrap').classList.add('on');
+        document.getElementById('hdrName').textContent = user.name;
+        document.getElementById('hdrRole').textContent = user.role === 'admin' ? '👑 관리자' : '🌱 신인';
+
+        if (user.role === 'admin') buildTabs(ADMIN_TABS, 'dashboard');
+        else                       buildTabs(SFP_TABS,   'my_stats');
+
+        showNoticeBanner();
+    }).catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = '로그인'; }
+        loginErr('네트워크 오류가 발생했습니다. 다시 시도해주세요');
+    });
+}
+
+function loginErr(msg) {
+    document.getElementById('loginErr').textContent = msg;
+    setTimeout(() => document.getElementById('loginErr').textContent = '', 3000);
+}
+
+function doLogout() {
+    currentUser = null; pendingFile = null; window._loggedIn = false;
+    document.getElementById('appWrap').classList.remove('on');
+    document.getElementById('loginScreen').style.display = 'flex';
+    document.getElementById('loginName').value = '';
+    document.getElementById('loginPw').value = '';
+    document.getElementById('noticeBanner').style.display = 'none';
+}
+
+// ============================================================
+// 📑 탭 시스템
+//
+// 💡 배열(Array)로 탭 목록 관리
+// - 탭 추가/제거가 쉬워짐
+// - .map()으로 배열 → HTML 변환
+// ============================================================
+const ADMIN_TABS = [
+    { id:'dashboard',  label:'📊 대시보드' },
+    { id:'weekly',     label:'📅 주간요약' },
+    { id:'calendar',   label:'🗓️ 달력' },
+    { id:'routes',     label:'🗺️ 일정현황' },
+    { id:'members',    label:'🌱 신인관리' },
+    { id:'notices',    label:'📢 공지관리' },
+    { id:'messages',   label:'✉️ 쪽지함' },
+    { id:'coaching',   label:'💬 코칭노트' },
+    { id:'consents',   label:'✅ 동의기록' },
+    { id:'activities', label:'📋 활동기록' },
+    { id:'contracts',  label:'📝 계약기록' },
+    { id:'promos',     label:'🏆 장표관리' },
+    { id:'export',     label:'📥 내보내기' },
+];
+const SFP_TABS = [
+    { id:'my_stats',    label:'📊 내 실적' },
+    { id:'weekly',      label:'📅 주간요약' },
+    { id:'calendar',    label:'🗓️ 달력' },
+    { id:'my_route',    label:'🗺️ 오늘일정' },
+    { id:'my_consent',  label:'✅ 동의입력' },
+    { id:'my_contract', label:'📝 계약입력' },
+    { id:'my_message',  label:'✉️ 쪽지' },
+    { id:'materials',   label:'🏆 자료실' },
+];
+
+function buildTabs(tabs, defaultId) {
+    document.getElementById('tabNav').innerHTML =
+        tabs.map(t => `<button id="tb_${t.id}" class="t-btn" onclick="goTab('${t.id}')">${t.label}</button>`).join('');
+    goTab(defaultId);
+}
+
+function goTab(id) {
+    window._currentTabId = id; // 실시간 리스너가 현재 탭 알 수 있도록
+    document.querySelectorAll('.t-btn').forEach(b => b.classList.remove('on'));
+    const btn = document.getElementById(`tb_${id}`);
+    if (btn) btn.classList.add('on');
+
+    const main = document.getElementById('appMain');
+    main.innerHTML = '';
+    const wrap = document.createElement('div');
+    main.appendChild(wrap);
+
+    // 💡 객체(Object)로 함수 매핑 - id에 맞는 함수를 바로 찾아서 실행
+    const pages = {
+        dashboard: pgDashboard, members: pgMembers,
+        consents: pgConsents,   activities: pgActivities,
+        contracts: pgContracts, promos: pgPromos, export: pgExport,
+        calendar: pgCalendar,   routes: pgRoutes,
+        weekly: pgWeekly,       coaching: pgCoaching,
+        notices: pgNotices,     messages: pgMessages,
+        my_stats: pgMyStats,    my_consent: pgMyConsent,
+        my_activity: pgMyActivity, my_contract: pgMyContract,
+        my_message: pgMyMessage,
+        materials: pgMaterials, my_route: pgMyRoute
+    };
+    window._pageMap = pages; // 실시간 리스너가 현재 탭 새로고침에 사용
+    if (pages[id]) pages[id](wrap);
+}
+
+// ============================================================
+// 🔧 유틸 함수들
+// ============================================================
+const uMap = () => Object.fromEntries(load('sfp_users').map(u => [u.id, u.name]));
+const sfpList = () => load('sfp_users').filter(u => u.role === 'sfp');
+const sfpOpts = () => sfpList().map(u => `<option value="${u.id}">${u.name}</option>`).join('');
+const allOpts = () => `<option value="">전체 SFP</option>` + sfpOpts();
+
+function delRec(key, id, cb) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    // 캐시에서 즉시 제거
+    window._cache[key] = (window._cache[key] || []).filter(r => r.id !== id);
+    // Firestore에서 직접 삭제 → 리스너가 감지해서 신인 화면에도 즉시 반영
+    db.collection(key).doc(String(id)).delete()
+        .catch(e => console.warn('삭제 오류:', e));
+    if (cb) cb();
+}
+
+// ============================================================
+// 📊 관리자 - 대시보드
+// ============================================================
+function pgDashboard(el) {
+    // 처음 열 때 선택 월 = 이번달
+    const selectedYM = el.dataset.dashYM || thisYM;
+    renderDashboard(el, selectedYM);
+}
+
+function renderDashboard(el, ym) {
+    el.dataset.dashYM = ym;
+    const [ymYear, ymMon] = ym.split('-').map(Number);
+    const labelYM = `${ymYear}년 ${ymMon}월`;
+
+    const contracts  = load('sfp_contracts').filter(c => c.date?.startsWith(ym));
+    const activities = load('sfp_activities').filter(a => a.date?.startsWith(ym));
+    const consents   = load('sfp_consents').filter(c => c.date?.startsWith(ym));
+    const premium    = contracts.reduce((s,c) => s+(c.premium||0), 0);
+    const totalTp    = contracts.reduce((s,c) => s+(c.tp||0), 0);
+    const members    = sfpList();
+
+    // 선택 가능한 월 목록 (데이터 있는 월 + 최근 12개월)
+    const allDates = [
+        ...load('sfp_contracts').map(c=>c.date?.slice(0,7)),
+        ...load('sfp_activities').map(a=>a.date?.slice(0,7)),
+        ...load('sfp_consents').map(c=>c.date?.slice(0,7)),
+    ].filter(Boolean);
+    const monthSet = new Set(allDates);
+    // 최근 12개월 항상 포함
+    for (let i=0; i<12; i++) {
+        const d = new Date(today.getFullYear(), today.getMonth()-i, 1);
+        monthSet.add(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`);
+    }
+    const months = [...monthSet].sort((a,b)=>b.localeCompare(a));
+
+    el.innerHTML = `
+    <div class="sec-hd">
+        <h2>팀 실적 현황</h2>
+        <select class="inp" style="font-size:12px;padding:5px 10px;height:auto;width:auto"
+            onchange="renderDashboard(this.closest('[data-dash-y-m]')||document.getElementById('appMain').firstChild, this.value)">
+            ${months.map(m => `<option value="${m}" ${m===ym?'selected':''}>${m.replace('-','년 ')}월</option>`).join('')}
+        </select>
+    </div>
+    <div class="stat-grid">
+        ${[
+            {l:`${labelYM} 계약`, v:contracts.length,   u:'건', c:'var(--gold)'},
+            {l:'고객미팅',        v:activities.length,  u:'건', c:'var(--blue)'},
+            {l:'컨설팅 동의',     v:consents.length,    u:'건', c:'var(--green)'},
+            {l:'총 보험료',       v:fmt(premium),       u:'원', c:'var(--navy)'},
+            {l:'총 환산TP',       v:String(totalTp),    u:'',   c:'var(--gold)'},
+        ].map(s => `<div class="stat-card" style="--accent-color:${s.c}">
+            <div class="stat-lbl">${s.l}</div>
+            <div class="stat-v" style="color:${s.c};font-size:${String(s.v).length>7?'16px':'24px'}">${s.v}<span style="font-size:12px;font-weight:500;margin-left:2px">${s.u}</span></div>
+        </div>`).join('')}
+    </div>
+    <div class="card">
+        <div class="card-hd">👤 신인별 실적 <span style="font-size:11px;color:var(--muted);font-weight:400">${labelYM} 기준</span></div>
+        <div class="sfp-grid">
+            ${members.length ? members.map(m => {
+                const mc       = contracts.filter(c=>c.userId===m.id);
+                const curTp    = mc.reduce((s,c)=>s+(c.tp||0),0);
+                const curAct   = activities.filter(a=>a.userId===m.id).length;
+                const tpRate   = m.targetTp  > 0 ? Math.round(curTp /m.targetTp *100) : 0;
+                const actRate  = m.targetAct > 0 ? Math.round(curAct/m.targetAct*100) : 0;
+                const tpColor  = tpRate >=100?'var(--success)':tpRate >=60?'var(--warning)':'var(--danger)';
+                const actColor = actRate>=100?'var(--success)':actRate>=60?'var(--warning)':'var(--danger)';
+                const tpPc     = tpRate >=100?'pg':tpRate >=60?'pm':'pl';
+                const actPc    = actRate>=100?'pg':actRate>=60?'pm':'pl';
+                return `<div class="sfp-c">
+                    <div class="sfp-cn">
+                        <div class="sfp-avatar">${m.name.charAt(0)}</div>
+                        ${m.name}
+                    </div>
+                    <div class="sfp-r" style="margin-bottom:4px"><span>환산TP (목표 ${m.targetTp||'미설정'})</span><strong>${curTp}</strong></div>
+                    <div class="prog-bg" style="margin:4px 0 2px"><div class="prog ${tpPc}" style="width:${m.targetTp>0?Math.min(tpRate,100):0}%"></div></div>
+                    <div style="text-align:right;font-size:11px;font-weight:800;color:${m.targetTp>0?tpColor:'var(--muted)'};margin-bottom:10px">${m.targetTp>0?tpRate+'%':'-'}</div>
+                    <div class="sfp-r" style="margin-bottom:4px"><span>활동량 (목표 ${m.targetAct||'미설정'}건)</span><strong>${curAct}건</strong></div>
+                    <div class="prog-bg" style="margin:4px 0 2px"><div class="prog ${actPc}" style="width:${m.targetAct>0?Math.min(actRate,100):0}%"></div></div>
+                    <div style="text-align:right;font-size:11px;font-weight:800;color:${m.targetAct>0?actColor:'var(--muted)'};margin-bottom:10px">${m.targetAct>0?actRate+'%':'-'}</div>
+                    <div class="sfp-r"><span>동의</span><strong>${consents.filter(c=>c.userId===m.id).length}건</strong></div>
+                    <div class="sfp-r"><span>보험료 합계</span><strong>${fmt(mc.reduce((s,c)=>s+(c.premium||0),0))}원</strong></div>
+                </div>`;
+            }).join('') : `<div class="empty" style="grid-column:1/-1"><div class="empty-ico">👥</div><div>신인관리 탭에서 신인을 확인해주세요</div></div>`}
+        </div>
+    </div>`;
+}
+
+// ============================================================
+// 👥 팀원 관리 (관리자 전용)
+//
+// 💡 여기서 배우는 것: CRUD
+// Create(추가) Read(조회) Update(수정) Delete(삭제)
+// - 모든 앱의 기본 4가지 동작
+// ============================================================
+function pgMembers(el) {
+    const members  = sfpList();
+    const contracts= load('sfp_contracts').filter(c => c.date?.startsWith(thisYM));
+    const mc       = contracts; // 이번달 계약 전체 (신인별 필터는 아래서 처리)
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>신인 관리</h2><span style="font-size:12px;color:var(--muted)">총 ${members.length}명</span></div>
+    <div class="card" style="background:#EFF6FF;border:1.5px solid #BFDBFE">
+        <div style="font-size:13px;color:#1E40AF;font-weight:600;line-height:1.7">
+            💡 신인이 <strong>계정 만들기</strong>로 직접 가입하면 자동으로 여기에 추가됩니다.
+        </div>
+    </div>
+
+    <!-- 월 목표 일괄 설정 -->
+    <div class="card">
+        <div class="card-hd">🎯 이번달 목표 설정 <span style="font-size:11px;color:var(--muted);font-weight:400">${today.getFullYear()}년 ${today.getMonth()+1}월</span></div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:14px">신인별 이번달 환산TP 목표와 활동량 목표를 설정하세요</div>
+        ${members.length ? `
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+            <div style="display:grid;grid-template-columns:1fr 80px 80px 60px;gap:8px;padding:6px 14px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.3px">
+                <span>이름</span><span style="text-align:center">환산TP</span><span style="text-align:center">활동량</span><span></span>
+            </div>
+            ${members.map(m => {
+                const curTp  = mc.filter(c=>c.userId===m.id).reduce((s,c)=>s+(c.tp||0),0);
+                const curAct = load('sfp_routes').filter(r=>r.userId===m.id&&r.rtype==='고객미팅'&&r.date?.startsWith(thisYM)).length;
+                const tpRate  = m.targetTp  > 0 ? Math.round(curTp /m.targetTp *100) : 0;
+                const actRate = m.targetAct > 0 ? Math.round(curAct/m.targetAct*100) : 0;
+                const tpColor  = tpRate >=100?'var(--green)':tpRate >=60?'var(--amber)':'var(--red)';
+                const actColor = actRate>=100?'var(--green)':actRate>=60?'var(--amber)':'var(--red)';
+                return `<div style="display:flex;align-items:center;gap:8px;padding:11px 14px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border)">
+                    <div class="sfp-avatar" style="width:28px;height:28px;font-size:12px;flex-shrink:0">${m.name.charAt(0)}</div>
+                    <div style="font-size:13px;font-weight:700;color:var(--ink);flex:1">${m.name}</div>
+                    <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+                        <input type="number" id="tp_${m.id}" class="inp" value="${m.targetTp||''}" min="0"
+                            placeholder="목표" style="width:80px;font-size:13px;padding:7px 8px;text-align:center">
+                        ${m.targetTp>0?`<span style="font-size:10px;color:${tpColor};font-weight:700">${curTp}/${m.targetTp} (${tpRate}%)</span>`:''}
+                    </div>
+                    <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+                        <input type="number" id="act_${m.id}" class="inp" value="${m.targetAct||''}" min="0"
+                            placeholder="목표" style="width:80px;font-size:13px;padding:7px 8px;text-align:center">
+                        ${m.targetAct>0?`<span style="font-size:10px;color:${actColor};font-weight:700">${curAct}/${m.targetAct} (${actRate}%)</span>`:''}
+                    </div>
+                    <button class="btn btn-p btn-sm" onclick="updateTarget('${m.id}')">저장</button>
+                </div>`;
+            }).join('')}
+        </div>` : `<div class="empty"><div class="empty-ico">🌱</div><div>가입된 신인이 없습니다</div></div>`}
+    </div>
+
+    <!-- 비밀번호 관리 & 계정 삭제 -->
+    <div class="card">
+        <div class="card-hd">🔑 비밀번호 변경 & 계정 삭제</div>
+        ${members.length ? members.map(m => `
+        <div style="padding:14px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border);margin-bottom:10px">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+                <div class="sfp-avatar" style="width:28px;height:28px;font-size:12px;flex-shrink:0">${m.name.charAt(0)}</div>
+                <strong style="font-size:14px;color:var(--ink)">${m.name}</strong>
+                <span style="font-size:11px;color:var(--muted);margin-left:auto">${m.joinDate||'-'} 가입</span>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <input type="password" id="np_${m.id}" class="inp" placeholder="새 비밀번호 입력"
+                    style="font-size:13px;padding:8px 12px">
+                <button class="btn btn-o btn-sm" onclick="changePw('${m.id}')" style="white-space:nowrap">🔑 변경</button>
+            </div>
+            <button class="btn btn-d btn-sm" style="width:100%;justify-content:center"
+                onclick="delMember('${m.id}')">
+                🗑️ ${m.name} 계정 삭제
+            </button>
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">🌱</div><div>아직 가입한 신인이 없습니다</div></div>`}
+    </div>`;
+}
+
+// 목표 수정 (관리자 전용) - 환산TP + 활동량
+function updateTarget(id) {
+    const tp  = parseFloat(document.getElementById(`tp_${id}`)?.value) || 0;
+    const act = parseInt(document.getElementById(`act_${id}`)?.value)  || 0;
+    // 개별 문서 업데이트 → 다른 유저 데이터에 영향 없음
+    db.collection('sfp_users').doc(String(id)).update({
+        targetTp: tp, targetAct: act, target: act
+    }).then(() => {
+        const users = load('sfp_users');
+        const u = users.find(u => u.id === id);
+        if (u) { u.targetTp = tp; u.targetAct = act; u.target = act; }
+        alert(`✅ 목표 저장 완료\n환산TP: ${tp}  /  활동량: ${act}건`);
+        goTab('members');
+    }).catch(e => {
+        console.warn(e);
+        alert('저장 중 오류가 발생했습니다');
+    });
+}
+
+function delMember(id) {
+    if (!confirm('삭제 시 관련 기록도 함께 삭제됩니다. 계속할까요?')) return;
+    db.collection('sfp_users').doc(String(id)).delete().then(() => {
+        window._cache['sfp_users'] = load('sfp_users').filter(u => u.id !== id);
+        goTab('members');
+    });
+}
+
+function changePw(id) {
+    const np = document.getElementById(`np_${id}`)?.value;
+    if (!np) return alert('새 비밀번호를 입력해주세요');
+    db.collection('sfp_users').doc(String(id)).update({ password: np }).then(() => {
+        const users = load('sfp_users');
+        const u = users.find(u => u.id === id);
+        if (u) u.password = np;
+        alert('비밀번호가 변경되었습니다');
+        goTab('members');
+    });
+}
+
+// ============================================================
+// ✅ 동의 기록 공용 (관리자/SFP 분기)
+// ============================================================
+function consentFormHtml(isAdmin) {
+    return `
+    <div class="card">
+        <div class="card-hd">➕ 동의 기록 추가</div>
+        <div class="grid2">
+            ${isAdmin?`<div class="fg"><label class="lbl">SFP *</label><select id="cU" class="inp">${sfpOpts()||'<option>팀원을 먼저 추가하세요</option>'}</select></div>`:''}
+            <div class="fg"><label class="lbl">고객명 *</label><input id="cCl" class="inp" placeholder="고객 이름"></div>
+            <div class="fg"><label class="lbl">동의 유형</label>
+                <select id="cTy" class="inp"><option>필수컨설팅동의</option><option>개인정보활용동의</option><option>마케팅동의</option><option>기타</option></select>
+            </div>
+            <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="cDt" class="inp" value="${todayStr}"></div>
+            <div class="fg"><label class="lbl">메모</label><input id="cNo" class="inp" placeholder="특이사항"></div>
+        </div>
+        <button class="btn btn-p" onclick="submitConsent(${isAdmin})">+ 추가</button>
+    </div>`;
+}
+
+function pgConsents(el) {
+    el.innerHTML = `<div class="sec-hd"><h2>동의 기록</h2></div>` + consentFormHtml(true);
+    const td = document.createElement('div'); td.className='card';
+    td.innerHTML=`<div class="card-hd">📋 동의 목록</div>
+        <div class="fbar">
+            <select id="fcU" class="inp" onchange="refreshConsents()">${allOpts()}</select>
+            <input type="month" id="fcM" class="inp" value="${thisYM}" onchange="refreshConsents()">
+        </div><div id="cTA"></div>`;
+    el.appendChild(td); refreshConsents();
+}
+
+function refreshConsents() {
+    const fu=document.getElementById('fcU')?.value||'', fm=document.getElementById('fcM')?.value||'';
+    let d=load('sfp_consents');
+    if(fu) d=d.filter(c=>c.userId===fu);
+    if(fm) d=d.filter(c=>c.date?.startsWith(fm));
+    d.sort((a,b)=>b.date.localeCompare(a.date));
+    const um=uMap();
+    document.getElementById('cTA').innerHTML = d.length
+        ? `<div class="tw"><table><thead><tr><th>날짜</th><th>SFP</th><th>고객명</th><th>유형</th><th>메모</th><th></th></tr></thead><tbody>
+            ${d.map(c=>`<tr><td>${c.date}</td><td><strong>${um[c.userId]||'?'}</strong></td><td>${c.client}</td>
+            <td><span class="badge bi">${c.type}</span></td><td>${c.note||'-'}</td>
+            <td><button class="btn btn-d btn-sm" onclick="delRec('sfp_consents','${c.id}',refreshConsents)">삭제</button></td></tr>`).join('')}
+            </tbody></table></div>`
+        : `<div class="empty"><div class="empty-ico">✅</div><div>기록이 없습니다</div></div>`;
+}
+
+function submitConsent(isAdmin) {
+    const uid=isAdmin?document.getElementById('cU')?.value:currentUser.id;
+    const cl=document.getElementById('cCl').value.trim();
+    const ty=document.getElementById('cTy').value;
+    const dt=document.getElementById('cDt').value;
+    const no=document.getElementById('cNo').value.trim();
+    if(!uid) return alert('SFP를 선택해주세요');
+    if(!cl)  return alert('고객명을 입력해주세요');
+    if(!dt)  return alert('날짜를 입력해주세요');
+    const d=load('sfp_consents');
+    d.push({id:genId(),userId:uid,client:cl,type:ty,date:dt,note:no});
+    save('sfp_consents',d);
+    document.getElementById('cCl').value='';
+    document.getElementById('cNo').value='';
+    if(isAdmin) refreshConsents();
+    else { goTab('my_consent'); }
+    alert('✅ 동의 기록 추가 완료');
+}
+
+// ============================================================
+// 📋 활동 기록
+// ============================================================
+function actFormHtml(isAdmin) {
+    return `
+    <div class="card">
+        <div class="card-hd">➕ 활동 추가</div>
+        <div class="grid2">
+            ${isAdmin?`<div class="fg"><label class="lbl">SFP *</label><select id="aU" class="inp">${sfpOpts()}</select></div>`:''}
+            <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="aDt" class="inp" value="${todayStr}"></div>
+            <div class="fg"><label class="lbl">활동 유형</label>
+                <select id="aTy" class="inp"><option>신규상담</option><option>재상담</option><option>미팅</option><option>전화상담</option><option>온라인상담</option><option>세미나</option><option>기타</option></select>
+            </div>
+            <div class="fg"><label class="lbl">고객명</label><input id="aCl" class="inp" placeholder="고객명 (선택)"></div>
+            <div class="fg"><label class="lbl">결과</label>
+                <select id="aRs" class="inp"><option>진행중</option><option>계약완료</option><option>거절</option><option>보류</option><option>재접촉예정</option></select>
+            </div>
+            <div class="fg"><label class="lbl">메모</label><input id="aNo" class="inp" placeholder="다음 액션, 특이사항"></div>
+        </div>
+        <button class="btn btn-p" onclick="submitActivity(${isAdmin})">+ 활동 추가</button>
+    </div>`;
+}
+
+function pgActivities(el) {
+    el.innerHTML=`<div class="sec-hd"><h2>활동 기록</h2></div>`+actFormHtml(true);
+    const td=document.createElement('div'); td.className='card';
+    td.innerHTML=`<div class="card-hd">📋 활동 목록</div>
+        <div class="fbar">
+            <select id="faU" class="inp" onchange="refreshActs()">${allOpts()}</select>
+            <select id="faTy" class="inp" onchange="refreshActs()"><option value="">전체 유형</option><option>신규상담</option><option>재상담</option><option>미팅</option><option>전화상담</option><option>세미나</option></select>
+            <input type="month" id="faM" class="inp" value="${thisYM}" onchange="refreshActs()">
+        </div><div id="aTA"></div>`;
+    el.appendChild(td); refreshActs();
+}
+
+function refreshActs() {
+    const fu=document.getElementById('faU')?.value||'',
+          ft=document.getElementById('faTy')?.value||'',
+          fm=document.getElementById('faM')?.value||'';
+    let d=load('sfp_activities');
+    if(fu) d=d.filter(a=>a.userId===fu);
+    if(ft) d=d.filter(a=>a.type===ft);
+    if(fm) d=d.filter(a=>a.date?.startsWith(fm));
+    d.sort((a,b)=>b.date.localeCompare(a.date));
+    const um=uMap();
+    const rb={'계약완료':'bs','진행중':'bi','거절':'bd','보류':'bw','재접촉예정':'bn'};
+    document.getElementById('aTA').innerHTML = d.length
+        ? `<div class="tw"><table><thead><tr><th>날짜</th><th>SFP</th><th>유형</th><th>고객/장소</th><th>결과</th><th>메모</th><th></th></tr></thead><tbody>
+            ${d.map(a=>`<tr>
+                <td>${a.date}</td><td><strong>${um[a.userId]||'?'}</strong></td>
+                <td>
+                    <span class="badge bi">${a.type}</span>
+                    ${a.fromChecklist ? `<span class="badge" style="background:var(--gold-bg);color:var(--gold);margin-left:4px;font-size:10px">📋자동</span>` : ''}
+                </td>
+                <td>${a.client||'-'}</td>
+                <td><span class="badge ${rb[a.result]||'bg_'}">${a.result}</span></td>
+                <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${a.note||''}">${a.note||'-'}</td>
+                <td><button class="btn btn-d btn-sm" onclick="delRec('sfp_activities','${a.id}',refreshActs)">삭제</button></td>
+            </tr>
+            <tr><td colspan="7" style="padding:6px 14px 12px;background:var(--bg)">
+                <div id="fbArea_${a.id}">${renderFeedbacks(a.id,'aTA')}</div>
+            </td></tr>`).join('')}
+            </tbody></table></div>`
+        : `<div class="empty"><div class="empty-ico">📋</div><div>활동 기록이 없습니다</div></div>`;
+}
+
+function submitActivity(isAdmin) {
+    const uid=isAdmin?document.getElementById('aU')?.value:currentUser.id;
+    const dt=document.getElementById('aDt').value;
+    const ty=document.getElementById('aTy').value;
+    const cl=document.getElementById('aCl').value.trim();
+    const rs=document.getElementById('aRs').value;
+    const no=document.getElementById('aNo').value.trim();
+    if(!uid) return alert('SFP를 선택해주세요');
+    if(!dt)  return alert('날짜를 입력해주세요');
+    const d=load('sfp_activities');
+    d.push({id:genId(),userId:uid,date:dt,type:ty,client:cl,result:rs,note:no});
+    save('sfp_activities',d);
+    document.getElementById('aCl').value='';
+    document.getElementById('aNo').value='';
+    if(isAdmin) refreshActs();
+    else goTab('my_activity');
+    alert('📋 활동 기록 완료');
+}
+
+// ============================================================
+// 📝 계약 기록
+// ============================================================
+function conFormHtml(isAdmin) {
+    return `
+    <div class="card">
+        <div class="card-hd">➕ 계약 추가</div>
+        <div class="grid2">
+            ${isAdmin?`<div class="fg"><label class="lbl">SFP *</label><select id="coU" class="inp">${sfpOpts()}</select></div>`:''}
+            <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="coDt" class="inp" value="${todayStr}"></div>
+            <div class="fg"><label class="lbl">고객명 *</label><input id="coCl" class="inp" placeholder="고객 이름"></div>
+            <div class="fg"><label class="lbl">보험 종류</label>
+                <select id="coPr" class="inp"><option>종신보험</option><option>건강보험</option><option>실손보험</option><option>연금보험</option><option>변액보험</option><option>CI보험</option><option>기타</option></select>
+            </div>
+            <div class="fg"><label class="lbl">상품명</label><input id="coPn" class="inp" placeholder="예: 퍼스트건강보험"></div>
+            <div class="fg"><label class="lbl">월 보험료(원)</label><input type="number" id="coPm" class="inp" placeholder="150000" min="0"></div>
+            <div class="fg"><label class="lbl">환산TP</label><input type="number" id="coTp" class="inp" placeholder="예: 85" min="0" step="0.1"></div>
+            <div class="fg"><label class="lbl">메모</label><input id="coNo" class="inp" placeholder="특이사항"></div>
+        </div>
+        <button class="btn btn-p" onclick="submitContract(${isAdmin})">+ 계약 추가</button>
+    </div>`;
+}
+
+function pgContracts(el) {
+    el.innerHTML=`<div class="sec-hd"><h2>계약 기록</h2></div>`+conFormHtml(true);
+    const td=document.createElement('div'); td.className='card';
+    td.innerHTML=`<div class="card-hd">📋 계약 목록</div>
+        <div class="fbar">
+            <select id="fcoU" class="inp" onchange="refreshCons()">${allOpts()}</select>
+            <input type="month" id="fcoM" class="inp" value="${thisYM}" onchange="refreshCons()">
+        </div><div id="coTA"></div>`;
+    el.appendChild(td); refreshCons();
+}
+
+function refreshCons() {
+    const fu=document.getElementById('fcoU')?.value||'', fm=document.getElementById('fcoM')?.value||'';
+    let d=load('sfp_contracts');
+    if(fu) d=d.filter(c=>c.userId===fu);
+    if(fm) d=d.filter(c=>c.date?.startsWith(fm));
+    d.sort((a,b)=>b.date.localeCompare(a.date));
+    const um=uMap();
+    const pb={'종신보험':'bg_','건강보험':'bs','실손보험':'bi','연금보험':'bw','변액보험':'bn'};
+    document.getElementById('coTA').innerHTML = d.length
+        ? `<div class="tw"><table><thead><tr><th>날짜</th><th>SFP</th><th>고객명</th><th>종류</th><th>상품명</th><th>월보험료</th><th>환산TP</th><th>메모</th><th></th></tr></thead><tbody>
+            ${d.map(c=>`<tr>
+                <td>${c.date}</td><td><strong>${um[c.userId]||'?'}</strong></td>
+                <td>${c.client}</td><td><span class="badge ${pb[c.product]||'bn'}">${c.product}</span></td>
+                <td>${c.productName||'-'}</td>
+                <td style="text-align:right;font-weight:700">${fmt(c.premium)}원</td>
+                <td style="text-align:right;font-weight:700;color:var(--gold)">${c.tp||'-'}</td>
+                <td>${c.note||'-'}</td>
+                <td><button class="btn btn-d btn-sm" onclick="delRec('sfp_contracts','${c.id}',refreshCons)">삭제</button></td>
+            </tr>
+            <tr><td colspan="9" style="padding:6px 14px 12px;background:var(--bg)">
+                <div id="fbArea_${c.id}">${renderFeedbacks(c.id,'coTA')}</div>
+            </td></tr>`).join('')}
+            </tbody></table></div>`
+        : `<div class="empty"><div class="empty-ico">📝</div><div>계약 기록이 없습니다</div></div>`;
+}
+
+function submitContract(isAdmin) {
+    const uid=isAdmin?document.getElementById('coU')?.value:currentUser.id;
+    const dt=document.getElementById('coDt').value;
+    const cl=document.getElementById('coCl').value.trim();
+    const pr=document.getElementById('coPr').value;
+    const pn=document.getElementById('coPn').value.trim();
+    const pm=parseInt(document.getElementById('coPm').value)||0;
+    const tp=parseFloat(document.getElementById('coTp').value)||0;
+    const no=document.getElementById('coNo').value.trim();
+    if(!uid) return alert('SFP를 선택해주세요');
+    if(!cl)  return alert('고객명을 입력해주세요');
+    if(!dt)  return alert('날짜를 입력해주세요');
+    const d=load('sfp_contracts');
+    d.push({id:genId(),userId:uid,date:dt,client:cl,product:pr,productName:pn,premium:pm,tp,note:no});
+    save('sfp_contracts',d);
+    ['coCl','coPn','coPm','coTp','coNo'].forEach(i=>{const el=document.getElementById(i);if(el)el.value='';});
+    if(isAdmin) refreshCons();
+    else goTab('my_contract');
+    alert('📝 계약 기록 완료');
+}
+
+// ============================================================
+// 🏆 장표 관리 (관리자 업로드)
+//
+// 💡 [코딩 개념 4: 파일 처리 - FileReader + base64]
+//
+// 이미지/PDF를 localStorage에 저장하는 방법:
+// 1. 사용자가 파일 선택 (input[type=file])
+// 2. FileReader가 파일을 base64 텍스트로 변환
+// 3. base64 텍스트를 localStorage에 저장
+// 4. 불러올 때 <img src="base64문자열"> 로 표시
+//
+// base64 = 파일(이진데이터)을 텍스트로 변환한 것
+// 예: 이미지 → "data:image/jpg;base64,/9j/4AAQ..."
+//
+// ⚠️ 제한: 파일당 4MB 이하, localStorage 총 5MB
+// ============================================================
+function pgPromos(el) {
+    el.innerHTML = `
+    <div class="sec-hd"><h2>장표 관리</h2></div>
+    <div class="card" style="text-align:center;padding:30px">
+        <div style="font-size:13px;color:var(--muted)">장표 불러오는 중...</div>
+    </div>`;
+    // 장표는 용량이 커서 탭 열 때 로드
+    window._fsLoad('sfp_promos').then(() => {
+        window._fsListen('sfp_promos');
+        _renderPromoPage(el);
+    });
+}
+
+function _renderPromoPage(el) {
+    el.innerHTML = `
+    <div class="sec-hd"><h2>장표 관리</h2></div>
+    <div class="card">
+        <div class="card-hd">📤 장표 업로드</div>
+        <div class="grid2">
+            <div class="fg"><label class="lbl">제목 *</label><input id="ptTitle" class="inp" placeholder="예: 3월 건강보험 집중 프로모션"></div>
+            <div class="fg"><label class="lbl">구분</label>
+                <select id="ptCat" class="inp"><option>프로모션</option><option>장표</option><option>공지</option><option>교육자료</option><option>이슈</option></select>
+            </div>
+            <div class="fg"><label class="lbl">기간/날짜</label><input id="ptPeriod" class="inp" placeholder="예: 3/1 ~ 3/31"></div>
+        </div>
+        <label class="lbl" style="margin-bottom:8px;display:block">이미지 선택 (슬롯 탭해서 각각 선택 · 최대 3장)</label>
+        <div style="display:flex;gap:8px;margin-bottom:14px">
+            ${[1,2,3].map(n => `
+            <div style="flex:1">
+                <div id="slot${n}" onclick="document.getElementById('fi${n}').click()"
+                    style="height:88px;background:var(--bg);border:2px dashed var(--border);border-radius:var(--r-sm);display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;overflow:hidden;transition:border-color .2s;-webkit-tap-highlight-color:transparent">
+                    <span style="font-size:26px">📷</span>
+                    <span style="font-size:11px;color:var(--muted);margin-top:3px">${n}번</span>
+                </div>
+                <input type="file" id="fi${n}" accept="image/*,.pdf" style="display:none" onchange="onSlotSelect(${n}, this.files[0])">
+            </div>`).join('')}
+        </div>
+        <button class="btn btn-p" style="width:100%;justify-content:center" onclick="uploadPromo()">📤 업로드</button>
+    </div>
+    <div class="card">
+        <div class="card-hd">📚 업로드된 장표 목록</div>
+        <div id="promoGridArea"></div>
+    </div>`;
+    pendingFiles = [null, null, null];
+    renderPromoGrid(true);
+}
+
+function onFileDrop(e) { e.preventDefault(); }
+
+let pendingFiles = [null, null, null];
+
+function onSlotSelect(n, file) {
+    if (!file) return;
+    if (file.size > 4*1024*1024) { alert('파일 크기는 4MB 이하여야 합니다'); return; }
+    if (!file.type.startsWith('image/') && file.type !== 'application/pdf') {
+        alert('이미지(JPG/PNG/GIF) 또는 PDF만 가능합니다'); return;
+    }
+    const reader = new FileReader();
+    reader.onload = ev => {
+        pendingFiles[n-1] = { data: ev.target.result, type: file.type==='application/pdf'?'pdf':'image', name: file.name };
+        const slot = document.getElementById('slot' + n);
+        if (file.type.startsWith('image/')) {
+            slot.innerHTML = `<img src="${ev.target.result}" style="width:100%;height:88px;object-fit:cover">`;
+        } else {
+            slot.innerHTML = `<span style="font-size:22px">📄</span><span style="font-size:10px;color:var(--sub);margin-top:3px;text-align:center;padding:0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%">${file.name}</span>`;
+        }
+        slot.style.borderColor = 'var(--gold)';
+        slot.style.background  = 'var(--gold-bg)';
+    };
+    reader.readAsDataURL(file);
+}
+
+function uploadPromo() {
+    const title  = document.getElementById('ptTitle').value.trim();
+    const cat    = document.getElementById('ptCat').value;
+    const period = document.getElementById('ptPeriod').value.trim();
+    if (!title) return alert('제목을 입력해주세요');
+    const selected = (pendingFiles||[]).filter(f => f !== null);
+    if (!selected.length) return alert('사진을 1장 이상 선택해주세요');
+
+    const d = load('sfp_promos');
+    selected.forEach((f, i) => {
+        const itemTitle = selected.length > 1 ? title + ' (' + (i+1) + ')' : title;
+        d.unshift({ id:genId(), title:itemTitle, cat, period, data:f.data, type:f.type, name:f.name, uploadedAt:todayStr });
+    });
+    save('sfp_promos', d);
+
+    const cnt = selected.length;
+    pendingFiles = [null, null, null];
+    document.getElementById('ptTitle').value = '';
+    document.getElementById('ptPeriod').value = '';
+    [1,2,3].forEach(n => {
+        const slot = document.getElementById('slot' + n);
+        if (slot) {
+            slot.innerHTML = '<span style="font-size:26px">📷</span><span style="font-size:11px;color:var(--muted);margin-top:3px">' + n + '번</span>';
+            slot.style.borderColor = 'var(--border)';
+            slot.style.background  = 'var(--bg)';
+        }
+        const fi = document.getElementById('fi' + n);
+        if (fi) fi.value = '';
+    });
+    renderPromoGrid(true);
+    alert('📤 ' + cnt + '장 업로드 완료!');
+}
+
+function renderPromoGrid(isAdmin) {
+    const data = load('sfp_promos');
+    const area = document.getElementById('promoGridArea');
+    if (!area) return;
+
+    // 업로드 월 목록 추출 (최신순)
+    const months = [...new Set(data.map(p => (p.uploadedAt||'').slice(0,7)))]
+        .filter(Boolean).sort((a,b) => b.localeCompare(a));
+
+    // 현재 선택된 월 (없으면 전체)
+    const selectedMonth = area.dataset.month || 'all';
+
+    const filtered = selectedMonth === 'all'
+        ? data
+        : data.filter(p => (p.uploadedAt||'').startsWith(selectedMonth));
+
+    const catColor = {프로모션:'bg_', 장표:'bi', 공지:'bd', 교육자료:'bs', 이슈:'bw'};
+
+    // 월 필터 탭
+    const tabsHtml = `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+        <button onclick="setPromoMonth('all')"
+            style="padding:5px 14px;border-radius:20px;border:none;cursor:pointer;font-size:12px;font-weight:700;font-family:inherit;
+            background:${selectedMonth==='all'?'var(--navy)':'var(--bg)'};
+            color:${selectedMonth==='all'?'#fff':'var(--sub)'};
+            border:1.5px solid ${selectedMonth==='all'?'var(--navy)':'var(--border)'}">
+            전체 (${data.length})
+        </button>
+        ${months.map(m => `
+        <button onclick="setPromoMonth('${m}')"
+            style="padding:5px 14px;border-radius:20px;border:none;cursor:pointer;font-size:12px;font-weight:700;font-family:inherit;
+            background:${selectedMonth===m?'var(--navy)':'var(--bg)'};
+            color:${selectedMonth===m?'#fff':'var(--sub)'};
+            border:1.5px solid ${selectedMonth===m?'var(--navy)':'var(--border)'}">
+            ${m.replace('-','년 ')}월 (${data.filter(p=>(p.uploadedAt||'').startsWith(m)).length})
+        </button>`).join('')}
+    </div>`;
+
+    area.innerHTML = tabsHtml + (filtered.length
+        ? `<div class="promo-grid">${filtered.map(p => `
+            <div class="promo-c">
+                <div onclick="viewPromo('${p.id}')">
+                    <div class="promo-thumb">
+                        ${p.type==='image'
+                            ? `<img src="${p.data}" alt="${p.title}" loading="lazy">`
+                            : `<div class="promo-pdf-ico">📄</div>`}
+                    </div>
+                    <div class="promo-info">
+                        <div class="promo-cat"><span class="badge ${catColor[p.cat]||'bg_'}">${p.cat}</span></div>
+                        <div class="promo-title">${p.title}</div>
+                        <div class="promo-period">${p.period?'📅 '+p.period:''} ${p.uploadedAt||''}</div>
+                    </div>
+                </div>
+                ${isAdmin?`<div style="padding:0 12px 12px"><button class="btn btn-d btn-sm" onclick="delPromo('${p.id}')">삭제</button></div>`:''}
+            </div>`).join('')}
+        </div>`
+        : `<div class="empty"><div class="empty-ico">📎</div><div>해당 월에 업로드된 장표가 없습니다</div></div>`);
+}
+
+function setPromoMonth(month) {
+    const area = document.getElementById('promoGridArea');
+    if (!area) return;
+    area.dataset.month = month;
+    const isAdmin = currentUser && currentUser.role === 'admin';
+    renderPromoGrid(isAdmin);
+}
+
+function viewPromo(id) {
+    const p = load('sfp_promos').find(p=>p.id===id);
+    if (!p) return;
+    document.getElementById('viewerTitle').textContent = p.title;
+    const body = document.getElementById('viewerBody');
+    if (p.type==='image') {
+        body.innerHTML = `<img src="${p.data}" style="max-width:100%;height:auto;border-radius:10px">`;
+    } else {
+        body.innerHTML = `
+            <p style="font-size:13px;color:var(--muted);margin-bottom:14px">PDF 파일입니다. 아래 버튼으로 열어보세요.</p>
+            <button class="btn btn-p" onclick="window.open('${p.data}','_blank')">📄 새 탭에서 PDF 열기</button>
+            <iframe src="${p.data}" width="100%" height="480px" style="border:none;border-radius:10px;margin-top:14px" title="${p.title}"></iframe>`;
+    }
+    document.getElementById('viewerModal').classList.add('on');
+}
+function closeViewer() { document.getElementById('viewerModal').classList.remove('on'); }
+
+function delPromo(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_promos', load('sfp_promos').filter(p=>p.id!==id));
+    renderPromoGrid(true);
+}
+
+// ============================================================
+// 📥 엑셀 내보내기 (관리자 전용)
+// ============================================================
+function pgExport(el) {
+    el.innerHTML = `
+    <div class="sec-hd"><h2>📥 내보내기</h2></div>
+    <div class="card" style="background:linear-gradient(135deg,var(--ink),var(--navy));color:#fff;text-align:center;padding:44px 24px">
+        <div style="font-size:46px;margin-bottom:14px">📊</div>
+        <div style="font-size:19px;font-weight:900;margin-bottom:8px">엑셀 보고서 내보내기</div>
+        <div style="font-size:13px;color:rgba(255,255,255,.5);margin-bottom:28px">인원별 종합 · 고객별 상세 · 기간별 추이 · 원본 데이터 11개 시트</div>
+        <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-g" onclick="doExport(null)">📊 전체 보고서</button>
+            <button class="btn btn-w" onclick="doExport('${thisYM}')">📅 이번달 보고서</button>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-hd">📋 시트 구성</div>
+        <div style="font-size:13px;color:var(--sub);line-height:2">
+            <div>📊 <strong>통계요약</strong> — 전체 현황 · 신인별 요약 · 월별 추이 · 유형/결과 분포</div>
+            <div>👥 <strong>신인별실적</strong> — 신인 × 월별 계약/활동/동의 크로스 테이블</div>
+            <div>👤 <strong>인원별종합</strong> — 환산TP·활동·동의·계약·달성률 한눈에</div>
+            <div>🔍 <strong>고객별상세</strong> — 고객 기준 동의·활동·계약 통합</div>
+            <div>📅 <strong>주차별추이</strong> — 주 단위 계약·활동·동의 흐름</div>
+            <div>📆 <strong>월별추이</strong> — 월 단위 실적 추이</div>
+            <div>🗓️ <strong>분기별추이</strong> — 분기 단위 실적 추이</div>
+            <div>📊 <strong>연도별추이</strong> — 연도 단위 누적 실적</div>
+            <div>✅ <strong>동의기록</strong> / 📋 <strong>활동기록</strong> / 📝 <strong>계약기록</strong> — 원본 데이터</div>
+        </div>
+        <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)">
+            ⚠️ 데이터는 이 브라우저에만 저장됩니다. 정기적으로 내보내기 해두세요.
+        </div>
+    </div>`;
+}
+
+function doExport(mf) {
+    const um      = uMap();
+    const members = sfpList();
+    const f       = d => !mf || d.date?.startsWith(mf);
+    const wb      = XLSX.utils.book_new();
+    const label   = mf ? mf.replace('-','년 ')+'월' : '전체';
+
+    // ── 데이터 로드
+    const cons  = load('sfp_contracts').filter(f);
+    const acts  = load('sfp_activities').filter(f);
+    const agrs  = load('sfp_consents').filter(f);
+
+    // ── 최근 6개월 배열
+    const months6 = Array.from({length:6}, (_,i) => {
+        const d = new Date(today.getFullYear(), today.getMonth()-5+i, 1);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    });
+
+    // ══════════════════════════════════════════
+    // [1] 📊 통계 요약 시트
+    // ══════════════════════════════════════════
+    const summary = [
+        ['선릉금융 SFP 팀 실적 보고서'],
+        [`기준: ${label}   /   작성일: ${todayStr}`],
+        [''],
+        ['■ 전체 현황'],
+        ['항목', '건수', '비고'],
+        ['총 계약 건수', cons.length, ''],
+        ['총 활동 건수', acts.length, ''],
+        ['필수컨설팅 동의', agrs.length, ''],
+        ['총 보험료 합계', cons.reduce((s,c)=>s+(c.premium||0),0), '원'],
+        ['총 환산TP 합계', cons.reduce((s,c)=>s+(c.tp||0),0), ''],
+        [''],
+        ['■ 신인별 실적 요약'],
+        ['이름', '계약', '활동', '동의', '총보험료(원)', '환산TP합계', '목표(건)', '달성률(%)'],
+        ...members.map(m => {
+            const mc = cons.filter(c=>c.userId===m.id);
+            const rate = m.target>0 ? Math.round(mc.length/m.target*100) : '-';
+            return [
+                m.name,
+                mc.length,
+                acts.filter(a=>a.userId===m.id).length,
+                agrs.filter(c=>c.userId===m.id).length,
+                mc.reduce((s,c)=>s+(c.premium||0),0),
+                mc.reduce((s,c)=>s+(c.tp||0),0),
+                m.target,
+                rate
+            ];
+        }),
+        [''],
+        ['■ 월별 추이 (최근 6개월)'],
+        ['월', '계약', '활동', '동의'],
+        ...months6.map(ym => [
+            ym,
+            load('sfp_contracts').filter(c=>c.date?.startsWith(ym)).length,
+            load('sfp_activities').filter(a=>a.date?.startsWith(ym)).length,
+            load('sfp_consents').filter(c=>c.date?.startsWith(ym)).length,
+        ]),
+        [''],
+        ['■ 활동 유형별 건수'],
+        ['유형', '건수', '비율(%)'],
+        ...(() => {
+            const t = {};
+            acts.forEach(a => t[a.type]=(t[a.type]||0)+1);
+            return Object.entries(t).sort((a,b)=>b[1]-a[1]).map(([k,v])=>[k,v,acts.length?Math.round(v/acts.length*100):0]);
+        })(),
+        [''],
+        ['■ 계약 종류별 건수'],
+        ['종류', '건수', '비율(%)'],
+        ...(() => {
+            const t = {};
+            cons.forEach(c => t[c.product]=(t[c.product]||0)+1);
+            return Object.entries(t).sort((a,b)=>b[1]-a[1]).map(([k,v])=>[k,v,cons.length?Math.round(v/cons.length*100):0]);
+        })(),
+        [''],
+        ['■ 활동 결과별 건수'],
+        ['결과', '건수', '비율(%)'],
+        ...(() => {
+            const t = {};
+            acts.forEach(a => t[a.result]=(t[a.result]||0)+1);
+            return Object.entries(t).sort((a,b)=>b[1]-a[1]).map(([k,v])=>[k,v,acts.length?Math.round(v/acts.length*100):0]);
+        })(),
+    ];
+    const wsSummary = XLSX.utils.aoa_to_sheet(summary);
+    wsSummary['!cols'] = [28,12,14,12,18,12,12].map(w=>({wch:w}));
+    XLSX.utils.book_append_sheet(wb, wsSummary, '📊통계요약');
+
+    // ══════════════════════════════════════════
+    // [2] 신인별 실적 (월별 상세)
+    // ══════════════════════════════════════════
+    const memberDetail = [
+        ['신인별 × 월별 실적 상세'],
+        ['이름', ...months6, '합계'],
+        ...['계약','활동','동의'].map(type => {
+            const key = type==='계약'?'sfp_contracts':type==='활동'?'sfp_activities':'sfp_consents';
+            const data = load(key);
+            return [
+                '',
+                ...[`[${type}]`],
+                ...Array(months6.length + 1).fill(''),
+            ];
+        }).flat(),
+    ];
+    // 신인별 × 월별 계약/활동/동의
+    const detailRows = [
+        ['신인별 × 월별 실적 상세'],
+        ['이름', '구분', ...months6, '합계'],
+    ];
+    members.forEach(m => {
+        ['계약','활동','동의'].forEach(type => {
+            const data = type==='계약'?cons:type==='활동'?acts:agrs;
+            const mData = data.filter(d=>d.userId===m.id);
+            const monthly = months6.map(ym => mData.filter(d=>d.date?.startsWith(ym)).length);
+            detailRows.push([m.name, type, ...monthly, monthly.reduce((s,v)=>s+v,0)]);
+        });
+        detailRows.push(['','','','','','','','']);
+    });
+    const wsDetail = XLSX.utils.aoa_to_sheet(detailRows);
+    wsDetail['!cols'] = [14,8,...months6.map(()=>({wch:10})),{wch:8}].map(w=>typeof w==='number'?{wch:w}:w);
+    XLSX.utils.book_append_sheet(wb, wsDetail, '👥신인별실적');
+
+    // ══════════════════════════════════════════
+    // [3~5] 원본 데이터 시트
+    // ══════════════════════════════════════════
+    const rawSheets = {
+        '✅동의기록': agrs.map(c=>({날짜:c.date, SFP:um[c.userId]||'', 고객명:c.client, 동의유형:c.type, 메모:c.note||''})),
+        '📋활동기록': acts.map(a=>({날짜:a.date, SFP:um[a.userId]||'', 유형:a.type, 고객명:a.client||'', 결과:a.result, 메모:a.note||''})),
+        '📝계약기록': cons.map(c=>({날짜:c.date, SFP:um[c.userId]||'', 고객명:c.client, 보험종류:c.product, 상품명:c.productName||'', 월보험료:c.premium||0, 환산TP:c.tp||0, 메모:c.note||''})),
+    };
+    Object.entries(rawSheets).forEach(([n,rows]) => {
+        const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{데이터없음:''}]);
+        if (rows.length) ws['!cols'] = Object.keys(rows[0]).map(k=>({wch:Math.max(k.length*2,12)}));
+        XLSX.utils.book_append_sheet(wb, ws, n);
+    });
+
+    // ── 공통 유틸
+    const allCons  = load('sfp_contracts');
+    const allActs  = load('sfp_activities');
+    const allAgrs  = load('sfp_consents');
+
+    const getWeek = dateStr => {
+        const d = new Date(dateStr);
+        const jan1 = new Date(d.getFullYear(), 0, 1);
+        return Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+    };
+    const getQuarter = dateStr => Math.ceil(parseInt(dateStr.slice(5,7)) / 3);
+    const getYear    = dateStr => dateStr.slice(0,4);
+    const getMonth   = dateStr => dateStr.slice(0,7);
+    const getMonthWeek = dateStr => {
+        const day = parseInt(dateStr.slice(8,10));
+        return `${dateStr.slice(0,7)} ${Math.ceil(day/7)}주차`;
+    };
+
+    const periodStat = (data_c, data_a, data_g, keyFn, label) => {
+        const periods = [...new Set([
+            ...data_c.map(d=>keyFn(d.date)),
+            ...data_a.map(d=>keyFn(d.date)),
+            ...data_g.map(d=>keyFn(d.date)),
+        ])].filter(Boolean).sort();
+        return periods.map(p => ({
+            [label]: p,
+            계약건수: data_c.filter(d=>keyFn(d.date)===p).length,
+            환산TP합계: data_c.filter(d=>keyFn(d.date)===p).reduce((s,c)=>s+(c.tp||0),0),
+            총보험료: data_c.filter(d=>keyFn(d.date)===p).reduce((s,c)=>s+(c.premium||0),0),
+            활동건수: data_a.filter(d=>keyFn(d.date)===p).length,
+            동의건수: data_g.filter(d=>keyFn(d.date)===p).length,
+        }));
+    };
+
+    // ══════════════════════════════════════════
+    // [6] 👤 인원별 종합 현황
+    // ══════════════════════════════════════════
+    const memberReport = members.map(m => {
+        const mc  = (mf ? cons : allCons).filter(c=>c.userId===m.id);
+        const ma  = (mf ? acts : allActs).filter(a=>a.userId===m.id);
+        const mag = (mf ? agrs : allAgrs).filter(c=>c.userId===m.id);
+        const totalTp  = mc.reduce((s,c)=>s+(c.tp||0),0);
+        const totalPm  = mc.reduce((s,c)=>s+(c.premium||0),0);
+        const tpRate   = m.targetTp  > 0 ? Math.round(totalTp/m.targetTp*100)+'%' : '-';
+        const actRate  = m.targetAct > 0 ? Math.round(ma.length/m.targetAct*100)+'%' : '-';
+        return {
+            이름: m.name,
+            환산TP목표: m.targetTp||0,
+            환산TP실적: totalTp,
+            TP달성률: tpRate,
+            활동목표: m.targetAct||0,
+            활동건수: ma.length,
+            활동달성률: actRate,
+            동의건수: mag.length,
+            계약건수: mc.length,
+            총보험료: totalPm,
+            주력상품: (() => {
+                const t={};
+                mc.forEach(c=>{t[c.product]=(t[c.product]||0)+1;});
+                return Object.entries(t).sort((a,b)=>b[1]-a[1])[0]?.[0]||'-';
+            })(),
+        };
+    });
+    const wsMember = XLSX.utils.json_to_sheet(memberReport.length ? memberReport : [{데이터없음:''}]);
+    if (memberReport.length) wsMember['!cols'] = Object.keys(memberReport[0]).map(k=>({wch:Math.max(k.length*2,14)}));
+    XLSX.utils.book_append_sheet(wb, wsMember, '👤인원별종합');
+
+    // ══════════════════════════════════════════
+    // [7] 🔍 고객별 상세 리포트
+    // ══════════════════════════════════════════
+    const clientMap = {};
+    const allConsData = mf ? cons : allCons;
+    const allActData  = mf ? acts : allActs;
+    const allAgrData  = mf ? agrs : allAgrs;
+
+    // 고객 기준 통합
+    [...allConsData, ...allActData, ...allAgrData].forEach(d => {
+        const cl = d.client;
+        const uid = d.userId;
+        if (!cl) return;
+        const key = uid+'__'+cl;
+        if (!clientMap[key]) clientMap[key] = { sfp: um[uid]||'', 고객명: cl, userId: uid, cons:[], acts:[], agrs:[] };
+    });
+    allAgrData.forEach(d => { const k=d.userId+'__'+d.client; if(clientMap[k]) clientMap[k].agrs.push(d); });
+    allActData.forEach(d => { const k=d.userId+'__'+(d.client||''); if(clientMap[k]) clientMap[k].acts.push(d); });
+    allConsData.forEach(d => { const k=d.userId+'__'+d.client; if(clientMap[k]) clientMap[k].cons.push(d); });
+
+    const clientReport = Object.values(clientMap)
+        .sort((a,b) => a.sfp.localeCompare(b.sfp) || a.고객명.localeCompare(b.고객명))
+        .map(c => ({
+            SFP: c.sfp,
+            고객명: c.고객명,
+            동의수령: c.agrs.length > 0 ? '✓' : '-',
+            활동건수: c.acts.length,
+            최근미팅: c.acts.sort((a,b)=>b.date.localeCompare(a.date))[0]?.date||'-',
+            계약건수: c.cons.length,
+            계약상품: c.cons.map(c=>c.productName||c.product).join(', ')||'-',
+            환산TP합계: c.cons.reduce((s,c)=>s+(c.tp||0),0),
+            총보험료합계: c.cons.reduce((s,c)=>s+(c.premium||0),0),
+            최근활동결과: c.acts.sort((a,b)=>b.date.localeCompare(a.date))[0]?.result||'-',
+        }));
+    const wsClient = XLSX.utils.json_to_sheet(clientReport.length ? clientReport : [{데이터없음:''}]);
+    if (clientReport.length) wsClient['!cols'] = Object.keys(clientReport[0]).map(k=>({wch:Math.max(k.length*2,12)}));
+    XLSX.utils.book_append_sheet(wb, wsClient, '🔍고객별상세');
+
+    // ══════════════════════════════════════════
+    // [8] 📅 주차별 추이
+    // ══════════════════════════════════════════
+    const weeklyData = periodStat(allCons, allActs, allAgrs, getMonthWeek, '주차');
+    const wsWeekly = XLSX.utils.json_to_sheet(weeklyData.length ? weeklyData : [{데이터없음:''}]);
+    if (weeklyData.length) wsWeekly['!cols'] = Object.keys(weeklyData[0]).map(k=>({wch:16}));
+    XLSX.utils.book_append_sheet(wb, wsWeekly, '📅주차별추이');
+
+    // ══════════════════════════════════════════
+    // [9] 📆 월별 추이
+    // ══════════════════════════════════════════
+    const monthlyData = periodStat(allCons, allActs, allAgrs, getMonth, '월');
+    const wsMonthly = XLSX.utils.json_to_sheet(monthlyData.length ? monthlyData : [{데이터없음:''}]);
+    if (monthlyData.length) wsMonthly['!cols'] = Object.keys(monthlyData[0]).map(k=>({wch:16}));
+    XLSX.utils.book_append_sheet(wb, wsMonthly, '📆월별추이');
+
+    // ══════════════════════════════════════════
+    // [10] 🗓️ 분기별 추이
+    // ══════════════════════════════════════════
+    const quarterlyData = periodStat(allCons, allActs, allAgrs,
+        d => `${getYear(d)}년 ${getQuarter(d)}분기`, '분기');
+    const wsQuarterly = XLSX.utils.json_to_sheet(quarterlyData.length ? quarterlyData : [{데이터없음:''}]);
+    if (quarterlyData.length) wsQuarterly['!cols'] = Object.keys(quarterlyData[0]).map(k=>({wch:16}));
+    XLSX.utils.book_append_sheet(wb, wsQuarterly, '🗓️분기별추이');
+
+    // ══════════════════════════════════════════
+    // [11] 📊 연도별 추이
+    // ══════════════════════════════════════════
+    const yearlyData = periodStat(allCons, allActs, allAgrs, getYear, '연도');
+    const wsYearly = XLSX.utils.json_to_sheet(yearlyData.length ? yearlyData : [{데이터없음:''}]);
+    if (yearlyData.length) wsYearly['!cols'] = Object.keys(yearlyData[0]).map(k=>({wch:16}));
+    XLSX.utils.book_append_sheet(wb, wsYearly, '📊연도별추이');
+
+    XLSX.writeFile(wb, `SFP팀보고서_${mf||'전체'}.xlsx`);
+    alert(`📊 "SFP팀보고서_${mf||'전체'}.xlsx" 다운로드 시작!\n총 11개 시트`);
+}
+
+
+// ============================================================
+// 🌱 SFP 전용 화면
+// ============================================================
+function pgMyStats(el) {
+    const me = currentUser;
+    const freshMe   = load('sfp_users').find(u => u.id === me.id) || me;
+    const mc        = load('sfp_contracts').filter(c=>c.userId===me.id&&c.date?.startsWith(thisYM));
+    const ms        = load('sfp_consents').filter(c=>c.userId===me.id&&c.date?.startsWith(thisYM));
+    const meetings  = load('sfp_routes').filter(r=>r.userId===me.id&&r.rtype==='고객미팅'&&r.date?.startsWith(thisYM));
+    const totalTp   = mc.reduce((s,c)=>s+(c.tp||0),0);
+    const pm        = mc.reduce((s,c)=>s+(c.premium||0),0);
+
+    const targetTp  = freshMe.targetTp  || 0;
+    const targetAct = freshMe.targetAct || 0;
+    const tpRate    = targetTp  > 0 ? Math.round(totalTp      / targetTp  * 100) : 0;
+    const actRate   = targetAct > 0 ? Math.round(meetings.length / targetAct * 100) : 0;
+
+    const tpColor  = tpRate >=100?'var(--green)':tpRate >=60?'var(--amber)':'var(--red)';
+    const actColor = actRate>=100?'var(--green)':actRate>=60?'var(--amber)':'var(--red)';
+    const tpPc     = tpRate >=100?'pg':tpRate >=60?'pm':'pl';
+    const actPc    = actRate>=100?'pg':actRate>=60?'pm':'pl';
+
+    const noGoal = targetTp === 0 && targetAct === 0;
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>내 실적</h2><span style="font-size:12px;color:var(--muted)">${today.getFullYear()}년 ${today.getMonth()+1}월</span></div>
+    ${noGoal ? `
+    <div style="background:#FFF7ED;border:1.5px solid #FED7AA;border-radius:var(--r-sm);padding:12px 14px;margin-bottom:14px;font-size:13px;color:#92400E;line-height:1.6">
+        ⚠️ 이번달 목표가 아직 설정되지 않았어요.
+        <span style="font-size:12px;color:var(--muted);display:block;margin-top:2px">관리자(CM)에게 월 목표 설정을 요청하세요.</span>
+    </div>` : ''}
+
+    <!-- 요약 카드 4개 -->
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:16px">
+        ${[
+            {l:'계약',      v:mc.length+'건',       c:'var(--navy)'},
+            {l:'고객미팅',  v:meetings.length+'건',  c:'var(--blue)'},
+            {l:'환산TP',    v:String(totalTp),       c:'var(--gold)'},
+            {l:'동의 수령', v:ms.length+'건',         c:'var(--green)'},
+        ].map(s=>`<div style="background:#fff;border:1px solid var(--border);border-radius:var(--r-sm);padding:14px;text-align:center;box-shadow:var(--sh-sm)">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">${s.l}</div>
+            <div style="font-size:${s.v.length>6?'16px':'22px'};font-weight:900;color:${s.c};margin-top:5px">${s.v}</div>
+        </div>`).join('')}
+    </div>
+
+    <!-- 환산TP 달성률 -->
+    <div class="card" style="border-top:3px solid var(--gold)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div>
+                <div style="font-size:13px;font-weight:700;color:var(--ink)">환산TP 달성률</div>
+                <div style="font-size:11px;color:var(--muted);margin-top:2px">
+                    ${totalTp} / ${targetTp > 0 ? targetTp : '미설정'}
+                </div>
+            </div>
+            <div style="font-size:22px;font-weight:900;color:${targetTp>0?tpColor:'var(--muted)'}">
+                ${targetTp > 0 ? tpRate+'%' : '-'}
+            </div>
+        </div>
+        <div class="prog-bg"><div class="prog ${tpPc}" style="width:${targetTp>0?Math.min(tpRate,100):0}%"></div></div>
+    </div>
+
+    <!-- 활동량 달성률 -->
+    <div class="card" style="border-top:3px solid var(--blue)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div>
+                <div style="font-size:13px;font-weight:700;color:var(--ink)">활동량 달성률 (고객미팅)</div>
+                <div style="font-size:11px;color:var(--muted);margin-top:2px">
+                    ${meetings.length}건 / ${targetAct > 0 ? targetAct+'건' : '미설정'}
+                </div>
+            </div>
+            <div style="font-size:22px;font-weight:900;color:${targetAct>0?actColor:'var(--muted)'}">
+                ${targetAct > 0 ? actRate+'%' : '-'}
+            </div>
+        </div>
+        <div class="prog-bg"><div class="prog ${actPc}" style="width:${targetAct>0?Math.min(actRate,100):0}%"></div></div>
+    </div>
+
+    ${mc.length?`<div class="card">
+        <div class="card-hd">📝 이번달 계약 내역</div>
+        <div class="tw"><table>
+            <thead><tr><th>날짜</th><th>고객명</th><th>종류</th><th>월보험료</th><th>환산TP</th></tr></thead>
+            <tbody>${mc.map(c=>`<tr>
+                <td>${c.date}</td><td>${c.client}</td><td>${c.product}</td>
+                <td style="text-align:right;font-weight:700">${fmt(c.premium)}원</td>
+                <td style="text-align:right;font-weight:700;color:var(--gold)">${c.tp||'-'}</td>
+            </tr>`).join('')}</tbody>
+        </table></div>
+    </div>`:''}
+
+    ${(() => {
+        const comments = load('sfp_quick_comments')
+            .filter(c => c.userId === me.id)
+            .sort((a,b) => b.at.localeCompare(a.at))
+            .slice(0, 5);
+        if (!comments.length) return '';
+        return `<div class="card">
+            <div class="card-hd">💬 CM 코멘트</div>
+            ${comments.map(c=>`
+            <div style="padding:11px 14px;background:var(--gold-bg);border-radius:var(--r-sm);margin-bottom:8px;border:1px solid rgba(184,146,42,.15)">
+                <div style="font-size:10.5px;color:var(--gold);font-weight:700;margin-bottom:4px">👑 ${c.by} · ${c.at}</div>
+                <div style="font-size:13px;color:var(--text);line-height:1.55">${c.text}</div>
+            </div>`).join('')}
+        </div>`;
+    })()}
+
+    ${(() => {
+        const note = load('sfp_coaching').find(n => n.userId===me.id && n.yearMonth===thisYM);
+        if (!note) return '';
+        return `<div class="card" style="border-left:4px solid var(--navy)">
+            <div class="card-hd">📅 이번달 CM 코칭 노트</div>
+            <div style="font-size:13px;color:var(--text);line-height:1.7;white-space:pre-wrap">${note.text}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:8px">${note.by} · ${note.at}</div>
+        </div>`;
+    })()}`;
+}
+
+function pgMyConsent(el) {
+    el.innerHTML = `<div class="sec-hd"><h2>동의 입력</h2></div>` + consentFormHtml(false);
+    const d = load('sfp_consents').filter(c=>c.userId===currentUser.id).sort((a,b)=>b.date.localeCompare(a.date));
+    const td=document.createElement('div'); td.className='card';
+    td.innerHTML=`<div class="card-hd">내 동의 기록 (${d.length}건)</div>
+        <div class="tw"><table><thead><tr><th>날짜</th><th>고객명</th><th>유형</th><th>메모</th></tr></thead>
+        <tbody>${d.length?d.map(c=>`<tr><td>${c.date}</td><td>${c.client}</td><td><span class="badge bi">${c.type}</span></td><td>${c.note||'-'}</td></tr>`).join(''):'<tr><td colspan="4"><div class="empty"><div class="empty-ico">✅</div><div>기록이 없습니다</div></div></td></tr>'}</tbody>
+        </table></div>`;
+    el.appendChild(td);
+}
+
+function pgMyActivity(el) {
+    el.innerHTML = `<div class="sec-hd"><h2>활동 입력</h2></div>` + actFormHtml(false);
+    const d = load('sfp_activities').filter(a=>a.userId===currentUser.id).sort((a,b)=>b.date.localeCompare(a.date));
+    const rb={'계약완료':'bs','진행중':'bi','거절':'bd','보류':'bw','재접촉예정':'bn'};
+    const td=document.createElement('div'); td.className='card';
+    td.innerHTML=`<div class="card-hd">내 활동 기록 (${d.length}건)</div>
+        ${d.length ? d.map(a=>`
+        <div style="padding:12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border);margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">${a.date}</div>
+                    <div style="font-size:13px;font-weight:700;color:var(--ink);margin-bottom:3px">${a.client||'-'} <span class="badge bi" style="font-size:10px">${a.type}</span></div>
+                    <div style="font-size:12px;color:var(--sub);margin-bottom:3px">${a.note||'-'}</div>
+                    <span class="badge ${rb[a.result]||'bg_'}" style="font-size:10px">${a.result}</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">
+                    <button class="btn btn-o btn-sm" onclick="editMyActivity('${a.id}')">수정</button>
+                    <button class="btn btn-d btn-sm" onclick="delMyActivity('${a.id}')">삭제</button>
+                </div>
+            </div>
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">📋</div><div>기록이 없습니다</div></div>`}`;
+    el.appendChild(td);
+}
+
+function editMyActivity(id) {
+    const acts = load('sfp_activities');
+    const a = acts.find(a => a.id === id);
+    if (!a) return;
+    const newNote   = prompt('메모 수정:', a.note||'');
+    if (newNote === null) return;
+    const newResult = prompt('결과 수정 (진행중/계약완료/거절/보류/재접촉예정):', a.result||'진행중');
+    if (newResult === null) return;
+    a.note   = newNote.trim();
+    a.result = newResult.trim();
+    save('sfp_activities', acts);
+    goTab('my_activity');
+}
+
+function delMyActivity(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_activities', load('sfp_activities').filter(a => a.id !== id));
+    goTab('my_activity');
+}
+
+function pgMyContract(el) {
+    el.innerHTML = `<div class="sec-hd"><h2>계약 입력</h2></div>` + conFormHtml(false);
+    const d = load('sfp_contracts').filter(c=>c.userId===currentUser.id).sort((a,b)=>b.date.localeCompare(a.date));
+    const pb={'종신보험':'bg_','건강보험':'bs','실손보험':'bi','연금보험':'bw'};
+    const td=document.createElement('div'); td.className='card';
+    td.innerHTML=`<div class="card-hd">내 계약 기록 (${d.length}건)</div>
+        ${d.length ? d.map(c=>`
+        <div style="padding:12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border);margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">${c.date}</div>
+                    <div style="font-size:13px;font-weight:700;color:var(--ink);margin-bottom:3px">${c.client} <span class="badge ${pb[c.product]||'bn'}" style="font-size:10px">${c.product}</span></div>
+                    <div style="font-size:12px;color:var(--sub);margin-bottom:3px">${c.productName||'-'}</div>
+                    <div style="font-size:12px;font-weight:700">
+                        보험료 <span style="color:var(--navy)">${fmt(c.premium)}원</span>
+                        · 환산TP <span style="color:var(--gold)">${c.tp||'-'}</span>
+                    </div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">
+                    <button class="btn btn-o btn-sm" onclick="editMyContract('${c.id}')">수정</button>
+                    <button class="btn btn-d btn-sm" onclick="delMyContract('${c.id}')">삭제</button>
+                </div>
+            </div>
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">📝</div><div>기록이 없습니다</div></div>`}`;
+    el.appendChild(td);
+}
+
+function editMyContract(id) {
+    const cons = load('sfp_contracts');
+    const c = cons.find(c => c.id === id);
+    if (!c) return;
+    const newPremium = prompt('월보험료 수정:', c.premium||'');
+    if (newPremium === null) return;
+    const newTp = prompt('환산TP 수정:', c.tp||'');
+    if (newTp === null) return;
+    const newNote = prompt('메모 수정:', c.note||'');
+    if (newNote === null) return;
+    c.premium = Number(newPremium) || c.premium;
+    c.tp      = Number(newTp) || c.tp;
+    c.note    = newNote.trim();
+    save('sfp_contracts', cons);
+    goTab('my_contract');
+}
+
+function delMyContract(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_contracts', load('sfp_contracts').filter(c => c.id !== id));
+    goTab('my_contract');
+}
+
+// ============================================================
+// 📅 달력 페이지 (관리자 + 신인 공통 열람, 관리자만 이벤트 추가)
+//
+// 💡 달력 만드는 원리:
+// 1. 해당 월 1일이 무슨 요일인지 계산
+// 2. 빈 칸(empty) + 날짜 칸을 7열 grid로 나열
+// 3. 각 날짜에 해당하는 이벤트를 필터링해서 표시
+// ============================================================
+let calYear  = today.getFullYear();
+let calMonth = today.getMonth(); // 0~11
+
+function pgCalendar(el) {
+    renderCalendar(el);
+}
+
+function renderCalendar(el) {
+    const isAdmin = currentUser.role === 'admin';
+    const yr = calYear, mo = calMonth;
+    const firstDay  = new Date(yr, mo, 1).getDay();   // 1일의 요일 (0=일)
+    const lastDate  = new Date(yr, mo+1, 0).getDate(); // 이번달 마지막 날
+    const events    = load('sfp_calendar');
+    const moStr     = `${yr}-${String(mo+1).padStart(2,'0')}`;
+
+    // 날짜 칸 생성
+    let cells = '';
+    for (let i=0; i<firstDay; i++) cells += `<div class="cal-cell empty"></div>`;
+    for (let d=1; d<=lastDate; d++) {
+        const dateStr = `${moStr}-${String(d).padStart(2,'0')}`;
+        const isToday = dateStr === todayStr;
+        // 기간 일정 포함 (해당 날짜가 startDate~endDate 사이인 것도 포함)
+        const dayEvts = events.filter(e => {
+            if (e.endDate && e.endDate > e.date) return dateStr >= e.date && dateStr <= e.endDate;
+            return e.date === dateStr;
+        });
+        const shown   = dayEvts.slice(0,2);
+        const more    = dayEvts.length - 2;
+        cells += `<div class="cal-cell${isToday?' today':''}" onclick="openCalDay('${dateStr}')">
+            <div class="cal-num">${d}</div>
+            ${shown.map(e=>`<div class="cal-evt type-${e.type}" title="${e.title}">${e.time?e.time+' ':' '}${e.title}</div>`).join('')}
+            ${more>0?`<div class="more-evt">+${more}개 더</div>`:''}
+        </div>`;
+    }
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>📅 달력</h2></div>
+    <div class="cal-wrap" id="calWrap">
+        <div class="cal-hdr">
+            <button class="cal-nav" onclick="calMove(-1,'${el.id||'calRoot'}')">◀</button>
+            <div class="cal-hdr-title">${yr}년 ${mo+1}월</div>
+            <button class="cal-nav" onclick="calMove(1,'${el.id||'calRoot'}')">▶</button>
+        </div>
+        <div class="cal-days-hdr">
+            ${['일','월','화','수','목','금','토'].map(d=>`<div class="cal-day-name">${d}</div>`).join('')}
+        </div>
+        <div class="cal-grid">${cells}</div>
+        <div class="cal-swipe-hint">← 좌우 스와이프로 월 이동 →</div>
+    </div>`;
+
+    // 스와이프 제스처 등록
+    const wrap = document.getElementById('calWrap');
+    if (wrap && !wrap._swipeInit) {
+        wrap._swipeInit = true;
+        let startX = 0, startY = 0;
+        wrap.addEventListener('touchstart', e => {
+            startX = e.touches[0].clientX;
+            startY = e.touches[0].clientY;
+        }, { passive: true });
+        wrap.addEventListener('touchend', e => {
+            const dx = e.changedTouches[0].clientX - startX;
+            const dy = e.changedTouches[0].clientY - startY;
+            if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 50) {
+                calMove(dx < 0 ? 1 : -1, '');
+            }
+        }, { passive: true });
+    }
+
+    if (isAdmin) {
+        el.innerHTML += `
+        <div class="card">
+            <div class="card-hd" id="calFormTitle">➕ 일정 추가</div>
+            <input type="hidden" id="evEditId" value="">
+            <div class="grid2">
+                <div class="fg"><label class="lbl">시작 날짜 *</label><input type="date" id="evDate" class="inp" value="${todayStr}"></div>
+                <div class="fg"><label class="lbl">종료 날짜 (기간 설정)</label><input type="date" id="evEndDate" class="inp"></div>
+                <div class="fg"><label class="lbl">시간</label><input type="time" id="evTime" class="inp"></div>
+                <div class="fg"><label class="lbl">구분</label>
+                    <select id="evType" class="inp">
+                        <option value="일정">📌 일정</option>
+                        <option value="마감">🔴 마감</option>
+                        <option value="행사">🎉 행사</option>
+                        <option value="교육">📚 교육</option>
+                        <option value="공지">📢 공지</option>
+                        <option value="기타">기타</option>
+                    </select>
+                </div>
+                <div class="fg"><label class="lbl">제목 *</label><input id="evTitle" class="inp" placeholder="예: 3월 프로모션 마감"></div>
+                <div class="fg full"><label class="lbl">메모</label><input id="evNote" class="inp" placeholder="상세 내용 (선택)"></div>
+            </div>
+            <div style="display:flex;gap:10px">
+                <button class="btn btn-p" style="flex:1;justify-content:center" onclick="addCalEvent()">+ 일정 추가</button>
+                <button class="btn btn-o" id="calCancelBtn" style="display:none" onclick="cancelEditCal()">취소</button>
+            </div>
+        </div>`;
+    } else {
+        el.innerHTML += `
+        <div class="card" style="background:#EFF6FF;border:1.5px solid #BFDBFE">
+            <div style="font-size:13px;color:#1E40AF;font-weight:600">📢 관리자가 공유한 일정입니다. 날짜를 클릭하면 상세 내용을 볼 수 있어요.</div>
+        </div>`;
+    }
+    el.dataset.calEl = 'true';
+}
+
+// 달력 월 이동
+// 💡 왜 전역변수(calYear, calMonth)를 쓸까?
+// - 이전/다음 버튼 클릭 시 "현재 보고 있는 달"을 기억해야 하기 때문
+function calMove(dir, elId) {
+    calMonth += dir;
+    if (calMonth > 11) { calMonth = 0; calYear++; }
+    if (calMonth < 0)  { calMonth = 11; calYear--; }
+    const el = document.getElementById('appMain').firstChild;
+    if (el) renderCalendar(el);
+}
+
+// 날짜 클릭 → 이벤트 모달
+function openCalDay(dateStr) {
+    const isAdmin = currentUser.role === 'admin';
+    const allEvts = load('sfp_calendar');
+    // 기간 일정 포함 - startDate~endDate 범위에 dateStr 포함되면 표시
+    const events = allEvts.filter(e => {
+        if (e.endDate && e.endDate > e.date) return dateStr >= e.date && dateStr <= e.endDate;
+        return e.date === dateStr;
+    });
+    const [yr, mo, d] = dateStr.split('-');
+    const dayNames = ['일','월','화','수','목','금','토'];
+    const dayName  = dayNames[new Date(parseInt(yr), parseInt(mo)-1, parseInt(d)).getDay()];
+    const typeColor= {일정:'#1E40AF',마감:'#991B1B',행사:'#92400E',공지:'#166534',교육:'#5B21B6',기타:'#374151'};
+    const typeBg   = {일정:'#DBEAFE',마감:'#FEE2E2',행사:'#FEF3C7',공지:'#DCFCE7',교육:'#EDE9FE',기타:'#F3F4F6'};
+
+    const evList = events.length
+        ? events.map(e=>`
+            <div class="evt-item">
+                <div class="evt-dot" style="background:${typeColor[e.type]||'#374151'}"></div>
+                <div style="flex:1">
+                    <div class="evt-item-text">${e.title}</div>
+                    ${e.endDate && e.endDate !== e.date
+                        ? `<div style="font-size:11px;color:var(--muted);margin-top:2px">📅 ${e.date} ~ ${e.endDate}</div>` : ''}
+                    ${e.note ? `<div style="font-size:11px;color:var(--muted);margin-top:2px">${e.note}</div>` : ''}
+                </div>
+                <div class="evt-item-time">${e.time||''}</div>
+                ${isAdmin ? `
+                <button class="btn btn-o btn-sm" style="padding:4px 8px;font-size:11px"
+                    onclick="editCalEvent('${e.id}');closeViewer()">수정</button>
+                <button class="btn btn-d btn-sm" style="padding:4px 8px;font-size:11px"
+                    onclick="delCalEvent('${e.id}','${dateStr}')">삭제</button>` : ''}
+            </div>`).join('')
+        : `<div class="empty" style="padding:24px"><div class="empty-ico">📭</div><div>이날 일정이 없습니다</div></div>`;
+
+    document.getElementById('viewerTitle').textContent = '';
+    document.getElementById('viewerBody').innerHTML = `
+        <div style="margin-bottom:16px">
+            <div class="evt-date-badge">${yr}년 ${parseInt(mo)}월 ${parseInt(d)}일 (${dayName})</div>
+        </div>
+        <div class="evt-list">${evList}</div>`;
+    document.getElementById('viewerModal').classList.add('on');
+}
+
+function addCalEvent() {
+    const editId  = document.getElementById('evEditId').value;
+    const date    = document.getElementById('evDate').value;
+    const endDate = document.getElementById('evEndDate').value;
+    const time    = document.getElementById('evTime').value;
+    const type    = document.getElementById('evType').value;
+    const title   = document.getElementById('evTitle').value.trim();
+    const note    = document.getElementById('evNote').value.trim();
+    if (!date || !title) return alert('날짜와 제목을 입력해주세요');
+    if (endDate && endDate < date) return alert('종료 날짜는 시작 날짜 이후여야 합니다');
+
+    const cal = load('sfp_calendar');
+    if (editId) {
+        // 수정 모드
+        const idx = cal.findIndex(e => e.id === editId);
+        if (idx >= 0) cal[idx] = { ...cal[idx], date, endDate, time, type, title, note };
+        save('sfp_calendar', cal);
+        cancelEditCal();
+        alert('📅 일정이 수정되었습니다');
+    } else {
+        // 추가 모드
+        cal.push({ id:genId(), date, endDate, time, type, title, note, by:currentUser.name });
+        save('sfp_calendar', cal);
+        document.getElementById('evTitle').value = '';
+        document.getElementById('evNote').value  = '';
+        document.getElementById('evTime').value  = '';
+        document.getElementById('evEndDate').value = '';
+        alert('📅 일정이 추가되었습니다');
+    }
+    const el = document.getElementById('appMain').firstChild;
+    if (el) renderCalendar(el);
+}
+
+function editCalEvent(id) {
+    const e = load('sfp_calendar').find(e => e.id === id);
+    if (!e) return;
+    document.getElementById('evEditId').value  = e.id;
+    document.getElementById('evDate').value    = e.date;
+    document.getElementById('evEndDate').value = e.endDate || '';
+    document.getElementById('evTime').value    = e.time || '';
+    document.getElementById('evType').value    = e.type;
+    document.getElementById('evTitle').value   = e.title;
+    document.getElementById('evNote').value    = e.note || '';
+    document.getElementById('calFormTitle').textContent = '✏️ 일정 수정';
+    document.getElementById('calCancelBtn').style.display = 'inline-flex';
+    // 폼으로 스크롤
+    document.getElementById('evDate').scrollIntoView({ behavior:'smooth', block:'center' });
+}
+
+function cancelEditCal() {
+    document.getElementById('evEditId').value  = '';
+    document.getElementById('evDate').value    = '';
+    document.getElementById('evEndDate').value = '';
+    document.getElementById('evTime').value    = '';
+    document.getElementById('evTitle').value   = '';
+    document.getElementById('evNote').value    = '';
+    document.getElementById('calFormTitle').textContent = '➕ 일정 추가';
+    document.getElementById('calCancelBtn').style.display = 'none';
+}
+
+function delCalEvent(id, dateStr) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_calendar', load('sfp_calendar').filter(e => e.id !== id));
+    closeViewer();
+    const el = document.getElementById('appMain').firstChild;
+    if (el) renderCalendar(el);
+}
+
+// ============================================================
+// 🗺️ 동선 현황 (관리자 전용 - 전체 신인 동선 조회)
+//
+// 💡 동선 데이터 구조:
+// { id, userId, date, time, location, note }
+// 날짜별로 그룹화해서 보여주는 것이 핵심
+// ============================================================
+function pgRoutes(el) {
+    const filterDate = todayStr;
+    el.innerHTML = `
+    <div class="sec-hd"><h2>🗺️ 동선 현황</h2></div>
+    <div class="card">
+        <div class="card-hd">📅 날짜 선택</div>
+        <div style="display:flex;gap:10px;align-items:center">
+            <input type="date" id="routeFilterDate" class="inp" value="${filterDate}" onchange="refreshRoutes()" style="max-width:180px">
+        </div>
+    </div>
+    <div id="routeResult"></div>`;
+    refreshRoutes();
+}
+
+function refreshRoutes() {
+    const date = document.getElementById('routeFilterDate')?.value || todayStr;
+    const routes = load('sfp_routes').filter(r => r.date === date);
+    const um = uMap();
+    // 신인별로 그룹화
+    const grouped = {};
+    routes.forEach(r => {
+        if (!grouped[r.userId]) grouped[r.userId] = [];
+        grouped[r.userId].push(r);
+    });
+    // 시간순 정렬
+    Object.values(grouped).forEach(arr => arr.sort((a,b) => (a.time||'').localeCompare(b.time||'')));
+
+    const [yr,mo,d] = date.split('-');
+    const dayName = ['일','월','화','수','목','금','토'][new Date(parseInt(yr), parseInt(mo)-1, parseInt(d)).getDay()];
+
+    const area = document.getElementById('routeResult');
+    if (!area) return;
+
+    if (!routes.length) {
+        area.innerHTML = `<div class="card"><div class="empty"><div class="empty-ico">🗺️</div><div>${yr}년 ${parseInt(mo)}월 ${parseInt(d)}일 (${dayName}) 등록된 동선이 없습니다</div></div></div>`;
+        return;
+    }
+
+    area.innerHTML = `<div class="card">
+        <div class="card-hd">📍 ${yr}년 ${parseInt(mo)}월 ${parseInt(d)}일 (${dayName}) 일정</div>
+        ${Object.entries(grouped).map(([uid, rows]) => `
+            <div class="route-date-hdr">👤 ${um[uid]||'(알수없음)'}</div>
+            ${rows.map(r => {
+                const isMeeting = r.rtype === '고객미팅' || !r.rtype; // 구버전 호환
+                const cl = isMeeting ? load('sfp_checklist').find(c => c.routeId === r.id) : null;
+                const typeStyleMap = {'고객미팅':'rt-meeting','이동':'rt-move','교육':'rt-edu','사내업무':'rt-internal','기타':'rt-etc'};
+                const typeIconMap  = {'고객미팅':'🤝','이동':'🚶','교육':'📚','사내업무':'🏢','기타':'📌'};
+                const tCls  = typeStyleMap[r.rtype||'고객미팅'] || 'rt-meeting';
+                const tIcon = typeIconMap[r.rtype||'고객미팅'] || '🤝';
+                return `
+                <div class="route-row" style="flex-wrap:wrap">
+                    <div class="route-time">${r.time||'-'}</div>
+                    <div style="flex:1;min-width:0">
+                        <div style="margin-bottom:3px"><span class="route-type ${tCls}">${tIcon} ${r.rtype||'고객미팅'}</span></div>
+                        ${r.client ? `<div style="font-size:13px;font-weight:700;color:var(--ink);margin-bottom:2px">👤 ${r.client}</div>` : ''}
+                        <div class="route-loc">📍 ${r.location}</div>
+                        ${r.note?`<div class="route-note">${r.note}</div>`:''}
+                    </div>
+                    <div style="display:flex;gap:6px;flex-shrink:0;margin-left:8px;align-items:center">
+                        ${isMeeting
+                            ? (cl
+                                ? `<button class="btn btn-g btn-sm" onclick="openChecklistView('${r.id}')" style="font-size:11px;padding:5px 10px">📋 결과보기</button>`
+                                : `<span style="font-size:11px;color:var(--dimmed)">체크리스트 미작성</span>`)
+                            : ''}
+                        <button class="btn btn-d btn-sm" onclick="delRoute('${r.id}')">삭제</button>
+                    </div>
+                </div>
+                ${cl ? renderChecklistBadge(cl) : ''}`;
+            }).join('')}
+            <div style="height:10px"></div>
+        `).join('')}
+    </div>`;
+}
+
+function delRoute(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_routes', load('sfp_routes').filter(r=>r.id!==id));
+    refreshRoutes();
+}
+
+// ============================================================
+// 🗺️ 내 동선 입력 (신인 전용)
+// ============================================================
+function pgMyRoute(el) {
+    const selectedDate = el.dataset.routeDate || todayStr;
+    renderMyRoute(el, selectedDate);
+}
+
+function renderMyRoute(el, selectedDate) {
+    el.dataset.routeDate = selectedDate;
+    const myRoutes = load('sfp_routes')
+        .filter(r => r.userId === currentUser.id && r.date === selectedDate)
+        .sort((a,b) => (a.time||'').localeCompare(b.time||''));
+
+    const typeStyle = {
+        '고객미팅': {cls:'rt-meeting', icon:'🤝'},
+        '이동':     {cls:'rt-move',    icon:'🚶'},
+        '교육':     {cls:'rt-edu',     icon:'📚'},
+        '사내업무': {cls:'rt-internal',icon:'🏢'},
+        '기타':     {cls:'rt-etc',     icon:'📌'},
+    };
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>🗺️ 내 일정</h2></div>
+    <div class="card">
+        <div class="card-hd">➕ 일정 추가</div>
+        <div class="grid2">
+            <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="rtDate" class="inp" value="${selectedDate}"
+                onchange="changeRouteDate(this.value)"></div>
+            <div class="fg"><label class="lbl">시간 *</label><input type="time" id="rtTime" class="inp"></div>
+            <div class="fg">
+                <label class="lbl">유형 *</label>
+                <select id="rtType" class="inp" onchange="onRouteTypeChange()">
+                    <option value="고객미팅">🤝 고객미팅</option>
+                    <option value="이동">🚶 이동</option>
+                    <option value="교육">📚 교육</option>
+                    <option value="사내업무">🏢 사내업무</option>
+                    <option value="기타">📌 기타</option>
+                </select>
+            </div>
+            <div class="fg client-field" id="clientFieldWrap">
+                <label class="lbl">고객명 <span style="color:var(--gold)">*고객미팅 시</span></label>
+                <input id="rtClient" class="inp" placeholder="예: 홍길동">
+            </div>
+            <div class="fg"><label class="lbl">장소 *</label><input id="rtLoc" class="inp" placeholder="예: 성수, 강남역, 본사"></div>
+            <div class="fg"><label class="lbl">메모</label><input id="rtNote" class="inp" placeholder="예: 재무설계 상담, 이동 중"></div>
+        </div>
+        <button class="btn btn-p" onclick="addRoute()">+ 추가</button>
+    </div>
+
+    <!-- 날짜 이동 바 -->
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;background:#fff;border-radius:var(--r-sm);padding:10px 14px;box-shadow:var(--sh-sm)">
+        <button class="btn btn-o btn-sm" style="flex-shrink:0" onclick="moveRouteDate(-1)">◀ 전날</button>
+        <div style="flex:1;text-align:center;font-size:14px;font-weight:800;color:var(--ink)">
+            ${selectedDate === todayStr ? `<span style="color:var(--gold)">오늘</span> ` : ''}${selectedDate}
+        </div>
+        <button class="btn btn-o btn-sm" style="flex-shrink:0" onclick="moveRouteDate(1)">다음날 ▶</button>
+    </div>
+
+    <div class="card">
+        <div class="card-hd">📍 ${selectedDate} 일정 (${myRoutes.length}건)</div>
+        ${myRoutes.length ? myRoutes.map(r => {
+            const isMeeting = r.rtype === '고객미팅';
+            const cl = isMeeting ? load('sfp_checklist').find(c => c.routeId === r.id) : null;
+            const ts = typeStyle[r.rtype||'고객미팅'] || typeStyle['기타'];
+            return `
+            <div class="route-row" style="flex-wrap:wrap">
+                <div class="route-time">${r.time||'-'}</div>
+                <div style="flex:1;min-width:0">
+                    <div style="margin-bottom:3px">
+                        <span class="route-type ${ts.cls}">${ts.icon} ${r.rtype||'고객미팅'}</span>
+                    </div>
+                    ${r.client ? `<div style="font-size:13px;font-weight:700;color:var(--ink);margin-bottom:2px">👤 ${r.client}</div>` : ''}
+                    <div class="route-loc">📍 ${r.location}</div>
+                    ${r.note?`<div class="route-note">${r.note}</div>`:''}
+                </div>
+                <div style="display:flex;gap:6px;margin-left:8px;flex-shrink:0;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+                    ${isMeeting ? `
+                        <button class="btn btn-sm ${cl?'btn-g':'btn-o'}"
+                            onclick="openChecklist('${r.id}','${(r.client||r.location).replace(/'/g,"\\'")}','${r.date}')"
+                            style="font-size:11px;padding:5px 10px">
+                            ${cl?'📋 수정':'📋 체크리스트'}
+                        </button>` : ''}
+                    <button class="btn btn-d btn-sm" onclick="delMyRoute('${r.id}')">삭제</button>
+                </div>
+            </div>`;
+        }).join('')
+        : `<div class="empty"><div class="empty-ico">🗺️</div><div>${selectedDate} 등록된 일정이 없습니다<br><span style="font-size:11px;color:var(--muted)">위에서 날짜를 선택하거나 ◀▶ 버튼으로 이동하세요</span></div></div>`}
+    </div>`;
+}
+
+function changeRouteDate(newDate) {
+    const el = document.getElementById('appMain').firstChild;
+    if (el) renderMyRoute(el, newDate);
+}
+
+function moveRouteDate(dir) {
+    const el = document.getElementById('appMain').firstChild;
+    if (!el) return;
+    const cur = new Date(el.dataset.routeDate || todayStr);
+    cur.setDate(cur.getDate() + dir);
+    const newDate = `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`;
+    renderMyRoute(el, newDate);
+}
+
+// 💡 유형이 바뀌면 고객명 필드를 흐리게/선명하게
+function onRouteTypeChange() {
+    const type = document.getElementById('rtType').value;
+    const wrap = document.getElementById('clientFieldWrap');
+    if (wrap) wrap.classList.toggle('hidden', type !== '고객미팅');
+}
+
+function addRoute() {
+    const date   = document.getElementById('rtDate').value;
+    const time   = document.getElementById('rtTime').value;
+    const rtype  = document.getElementById('rtType').value;
+    const client = rtype === '고객미팅' ? document.getElementById('rtClient').value.trim() : '';
+    const loc    = document.getElementById('rtLoc').value.trim();
+    const note   = document.getElementById('rtNote').value.trim();
+    if (!date||!loc) return alert('날짜와 장소를 입력해주세요');
+    if (rtype === '고객미팅' && !client) return alert('고객미팅은 고객명을 입력해주세요');
+
+    const routeId = genId();
+
+    // ① 일정 저장
+    const routes = load('sfp_routes');
+    routes.push({id:routeId, userId:currentUser.id, date, time, rtype, client, location:loc, note});
+    save('sfp_routes', routes);
+
+    // ② 고객미팅이면 활동기록 즉시 생성
+    // 💡 등록 즉시 카운팅 → 체크리스트 완료 시 해당 기록의 메모만 업데이트
+    if (rtype === '고객미팅') {
+        const acts = load('sfp_activities');
+        acts.push({
+            id: genId(),
+            userId: currentUser.id,
+            date, type: '미팅',
+            client,
+            result: '진행중',
+            note: `📍 ${loc}${note ? ' / '+note : ''}`,
+            fromChecklist: routeId,  // 체크리스트 연결 키 (동일하게 사용)
+        });
+        save('sfp_activities', acts);
+    }
+
+    ['rtClient','rtLoc','rtNote','rtTime'].forEach(id => {
+        const el = document.getElementById(id); if(el) el.value='';
+    });
+    goTab('my_route');
+    alert(rtype === '고객미팅' ? '🤝 고객미팅 등록 완료\n✅ 활동 1건이 바로 카운팅되었습니다' : '📍 일정이 추가되었습니다');
+}
+
+function delMyRoute(id) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_routes', load('sfp_routes').filter(r=>r.id!==id));
+    goTab('my_route');
+}
+
+
+// ============================================================
+// ② 공지 시스템
+// sfp_notices 컬렉션에 저장된 공지를 로그인 시 팝업으로 표시
+// ============================================================
+function showNoticeBanner() {
+    // 기존 달력 공지는 배너로 유지
+    const notices = load('sfp_calendar')
+        .filter(e => e.type === '공지')
+        .sort((a,b) => b.date.localeCompare(a.date));
+    const banner = document.getElementById('noticeBanner');
+    if (!notices.length) { banner.style.display='none'; }
+    else {
+        const n = notices[0];
+        banner.style.display = 'block';
+        banner.innerHTML = `
+            <div class="notice-banner">
+                <span class="notice-banner-icon">📢</span>
+                <div class="notice-banner-text">
+                    <strong>[공지]</strong> ${n.title}
+                    ${n.note ? `<span style="font-weight:400;opacity:.8;margin-left:8px">${n.note}</span>` : ''}
+                    <span style="opacity:.5;margin-left:8px;font-size:11px">${n.date}</span>
+                </div>
+                <button class="notice-banner-close" onclick="this.closest('.notice-banner').parentElement.style.display='none'">×</button>
+            </div>`;
+    }
+
+    // 새 공지 팝업 표시 (sfp_notices 컬렉션)
+    showNoticePopup();
+}
+
+function showNoticePopup() {
+    const notices = load('sfp_notices')
+        .filter(n => n.active)
+        .sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+    if (!notices.length) return;
+
+    const latest = notices[0];
+    // 이미 확인한 공지면 스킵
+    const confirmedKey = `notice_confirmed_${latest.id}`;
+    if (sessionStorage.getItem(confirmedKey)) return;
+
+    document.getElementById('noticeModalTitle').textContent = latest.title;
+    document.getElementById('noticeModalContent').textContent = latest.content;
+    document.getElementById('noticeModalDate').textContent = `${latest.by} · ${latest.createdAt}`;
+    document.getElementById('noticeModal').classList.add('on');
+    document.getElementById('noticeModal')._currentId = latest.id;
+}
+
+function closeNoticeModal(confirmed) {
+    const modal = document.getElementById('noticeModal');
+    const id = modal._currentId;
+    if (confirmed && id) {
+        sessionStorage.setItem(`notice_confirmed_${id}`, '1');
+    }
+    modal.classList.remove('on');
+}
+
+// 관리자 공지 관리 페이지
+function pgNotices(el) {
+    const notices = load('sfp_notices').sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+    el.innerHTML = `
+    <div class="sec-hd"><h2>📢 공지 관리</h2></div>
+    <div class="card">
+        <div class="card-hd">➕ 새 공지 작성</div>
+        <div class="fg"><label class="lbl">제목 *</label><input id="ntTitle" class="inp" placeholder="예: 3월 마감 안내"></div>
+        <div class="fg" style="margin-top:10px"><label class="lbl">내용 *</label>
+            <textarea id="ntContent" class="inp" rows="5" style="resize:vertical;line-height:1.6"
+                placeholder="신인들에게 전달할 공지 내용을 입력하세요.&#10;&#10;예: 이번 주 금요일까지 모든 계약 및 동의 기록을 입력해주세요."></textarea>
+        </div>
+        <button class="btn btn-p" style="width:100%;justify-content:center;margin-top:10px" onclick="addNotice()">📢 공지 등록</button>
+    </div>
+    <div class="card">
+        <div class="card-hd">📋 등록된 공지 목록</div>
+        ${notices.length ? notices.map(n => `
+        <div class="notice-item">
+            <div class="notice-item-header">
+                <div>
+                    <div class="notice-item-title">${n.title}</div>
+                    <div class="notice-item-date">${n.by} · ${n.createdAt}</div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <span style="font-size:12px;padding:3px 10px;border-radius:12px;font-weight:700;
+                        background:${n.active?'var(--greenBg,#E8F7EF)':'var(--border)'};
+                        color:${n.active?'var(--green)':'var(--muted)'}">
+                        ${n.active ? '● 활성' : '○ 비활성'}
+                    </span>
+                    <button class="btn btn-o btn-sm" onclick="toggleNotice('${n.id}')">
+                        ${n.active?'숨기기':'활성화'}
+                    </button>
+                    <button class="btn btn-d btn-sm" onclick="deleteNotice('${n.id}')">삭제</button>
+                </div>
+            </div>
+            <div class="notice-item-body">${n.content}</div>
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">📢</div><div>등록된 공지가 없습니다</div></div>`}
+    </div>`;
+}
+
+function addNotice() {
+    const title   = document.getElementById('ntTitle').value.trim();
+    const content = document.getElementById('ntContent').value.trim();
+    if (!title)   return alert('제목을 입력해주세요');
+    if (!content) return alert('내용을 입력해주세요');
+
+    const notices = load('sfp_notices');
+    // 기존 활성 공지 모두 비활성화 (최신 1개만 팝업)
+    notices.forEach(n => n.active = false);
+    notices.unshift({
+        id: genId(), title, content,
+        by: currentUser.name,
+        createdAt: todayStr,
+        active: true
+    });
+    save('sfp_notices', notices);
+    goTab('notices');
+    alert('📢 공지가 등록되었습니다!\n신인들이 다음 로그인 시 팝업으로 확인합니다.');
+}
+
+function toggleNotice(id) {
+    const notices = load('sfp_notices');
+    const n = notices.find(n => n.id === id);
+    if (!n) return;
+    if (!n.active) {
+        // 활성화 시 다른 공지 비활성화
+        notices.forEach(n => n.active = false);
+        n.active = true;
+    } else {
+        n.active = false;
+    }
+    save('sfp_notices', notices);
+    goTab('notices');
+}
+
+function deleteNotice(id) {
+    if (!confirm('공지를 삭제하시겠습니까?')) return;
+    db.collection('sfp_notices').doc(String(id)).delete().catch(e => console.warn(e));
+    window._cache['sfp_notices'] = load('sfp_notices').filter(n => n.id !== id);
+    goTab('notices');
+}
+
+// ============================================================
+// ✉️ 쪽지 시스템
+// sfp_messages = [{id, fromId, fromName, text, createdAt, read, reply, repliedAt}]
+// ============================================================
+
+// 신인 → 쪽지 보내기 & 내 쪽지함
+function pgMyMessage(el) {
+    const myMsgs = load('sfp_messages')
+        .filter(m => m.fromId === currentUser.id)
+        .sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>✉️ CM에게 쪽지 보내기</h2></div>
+    <div class="card">
+        <div class="card-hd">📝 새 쪽지</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:12px">CM에게 요청사항이나 문의를 남겨주세요</div>
+        <textarea id="msgText" class="inp" rows="4" style="resize:vertical;line-height:1.7;width:100%"
+            placeholder="예: 계약 입력 관련 문의드립니다.&#10;환산TP 계산 방법이 궁금합니다.&#10;이번 달 목표 조정 부탁드립니다."></textarea>
+        <button class="btn btn-p" style="width:100%;justify-content:center;margin-top:10px" onclick="sendMessage()">
+            📨 쪽지 보내기
+        </button>
+    </div>
+    <div class="card">
+        <div class="card-hd">📬 내가 보낸 쪽지 (${myMsgs.length}건)</div>
+        ${myMsgs.length ? myMsgs.map(m => `
+        <div style="margin-bottom:18px">
+            <div class="msg-bubble sent">
+                <div class="msg-text">${m.text}</div>
+                <div class="msg-meta">📤 ${m.createdAt}</div>
+            </div>
+            ${m.reply ? `
+            <div class="msg-reply-bubble">
+                <div style="font-size:10px;color:var(--gold);font-weight:700;margin-bottom:4px">👑 CM 답장</div>
+                <div class="msg-reply-text">${m.reply}</div>
+                <div class="msg-reply-meta">${m.repliedAt||''}</div>
+            </div>` : `
+            <div style="font-size:11px;color:var(--muted);text-align:right;margin-top:4px;padding-right:4px">⏳ 답장 대기 중</div>`}
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">✉️</div><div>보낸 쪽지가 없습니다</div></div>`}
+    </div>`;
+}
+
+function sendMessage() {
+    const text = document.getElementById('msgText').value.trim();
+    if (!text) return alert('내용을 입력해주세요');
+    const msgs = load('sfp_messages');
+    msgs.unshift({ id:genId(), fromId:currentUser.id, fromName:currentUser.name,
+        text, createdAt:todayStr, read:false, reply:'', repliedAt:'' });
+    save('sfp_messages', msgs);
+    document.getElementById('msgText').value = '';
+    goTab('my_message');
+    alert('📨 쪽지를 보냈습니다!\nCM이 확인 후 답장을 드릴 거예요.');
+}
+
+// 관리자 → 쪽지함
+function pgMessages(el) {
+    const msgs = load('sfp_messages').sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+    const unread = msgs.filter(m => !m.read).length;
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>✉️ 쪽지함</h2>
+        ${unread > 0 ? `<span style="background:#E53E4D;color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px">${unread}건 미확인</span>` : ''}
+    </div>
+    <div class="card">
+        <div class="card-hd">📬 받은 쪽지 (${msgs.length}건)</div>
+        ${msgs.length ? msgs.map(m => `
+        <div style="padding:16px;background:${m.read?'var(--bg)':'#EFF6FF'};border-radius:var(--r-sm);border:1.5px solid ${m.read?'var(--border)':'#BFDBFE'};margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <div style="display:flex;align-items:center;gap:8px">
+                    <div class="sfp-avatar" style="width:28px;height:28px;font-size:12px">${m.fromName.charAt(0)}</div>
+                    <span style="font-size:13px;font-weight:700;color:var(--ink)">${m.fromName}</span>
+                    ${!m.read ? '<span class="msg-unread"></span>' : ''}
+                </div>
+                <span style="font-size:11px;color:var(--muted)">${m.createdAt}</span>
+            </div>
+            <div style="font-size:13px;color:var(--ink);line-height:1.7;white-space:pre-wrap;padding:12px;background:#fff;border-radius:8px;margin-bottom:12px;border:1px solid var(--border)">${m.text}</div>
+            ${m.reply ? `
+            <div class="msg-reply-bubble">
+                <div style="font-size:10px;color:var(--gold);font-weight:700;margin-bottom:4px">👑 내 답장 · ${m.repliedAt}</div>
+                <div class="msg-reply-text">${m.reply}</div>
+            </div>
+            <button class="btn btn-o btn-sm" style="margin-top:6px" onclick="editReply('${m.id}')">✏️ 답장 수정</button>
+            ` : `
+            <textarea id="rt_${m.id}" class="inp" rows="2" style="resize:vertical;font-size:12px;margin-bottom:8px"
+                placeholder="답장 입력..."></textarea>
+            <div style="display:flex;gap:8px">
+                <button class="btn btn-p btn-sm" onclick="sendReply('${m.id}')">📨 답장 보내기</button>
+                <button class="btn btn-o btn-sm" onclick="markRead('${m.id}')">✓ 읽음</button>
+                <button class="btn btn-d btn-sm" onclick="deleteMsg('${m.id}')">삭제</button>
+            </div>`}
+        </div>`).join('')
+        : `<div class="empty"><div class="empty-ico">✉️</div><div>받은 쪽지가 없습니다</div></div>`}
+    </div>`;
+
+    // 페이지 열면 전체 읽음 처리
+    const msgs2 = load('sfp_messages');
+    let changed = false;
+    msgs2.forEach(m => { if (!m.read) { m.read = true; changed = true; } });
+    if (changed) save('sfp_messages', msgs2);
+}
+
+function sendReply(id) {
+    const text = document.getElementById(`rt_${id}`)?.value.trim();
+    if (!text) return alert('답장 내용을 입력해주세요');
+    const msgs = load('sfp_messages');
+    const m = msgs.find(m => m.id === id);
+    if (m) { m.reply = text; m.repliedAt = todayStr; m.read = true; save('sfp_messages', msgs); }
+    goTab('messages');
+    alert('📨 답장을 보냈습니다!');
+}
+
+function editReply(id) {
+    const msgs = load('sfp_messages');
+    const m = msgs.find(m => m.id === id);
+    if (!m) return;
+    const newReply = prompt('답장 수정:', m.reply);
+    if (newReply === null) return;
+    m.reply = newReply.trim(); m.repliedAt = todayStr;
+    save('sfp_messages', msgs);
+    goTab('messages');
+}
+
+function markRead(id) {
+    const msgs = load('sfp_messages');
+    const m = msgs.find(m => m.id === id);
+    if (m) { m.read = true; save('sfp_messages', msgs); }
+    goTab('messages');
+}
+
+function deleteMsg(id) {
+    if (!confirm('쪽지를 삭제하시겠습니까?')) return;
+    db.collection('sfp_messages').doc(String(id)).delete().catch(e=>console.warn(e));
+    window._cache['sfp_messages'] = load('sfp_messages').filter(m => m.id !== id);
+    goTab('messages');
+}
+
+// ============================================================
+// ① CM 피드백 기능
+// 활동/계약 기록에 CM이 한 줄 코멘트를 남기는 기능
+// 데이터: sfp_feedback = [{id, targetId, targetType, text, by, at}]
+// ============================================================
+function getFeedback(targetId) {
+    return load('sfp_feedback').filter(f => f.targetId === targetId);
+}
+
+function renderFeedbacks(targetId, container) {
+    const fbs = getFeedback(targetId);
+    const isAdmin = currentUser.role === 'admin';
+    const fbHtml = fbs.map(f => `
+        <div class="fb-box">
+            <div class="fb-avatar">CM</div>
+            <div class="fb-content">
+                <div class="fb-meta">${f.by} · ${f.at}</div>
+                <div class="fb-text">${f.text}</div>
+            </div>
+            ${isAdmin ? `<button onclick="delFeedback('${f.id}','${targetId}','${container}')" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:16px;padding:0 2px;line-height:1">×</button>` : ''}
+        </div>`).join('');
+
+    const addForm = isAdmin ? `
+        <div class="fb-form">
+            <input class="fb-inp" id="fbInp_${targetId}" placeholder="피드백 한 줄 남기기..." onkeydown="if(event.key==='Enter') addFeedback('${targetId}','${container}')">
+            <button class="btn btn-g btn-sm" onclick="addFeedback('${targetId}','${container}')">등록</button>
+        </div>` : '';
+
+    return fbHtml + addForm;
+}
+
+function addFeedback(targetId, container) {
+    const inp = document.getElementById(`fbInp_${targetId}`);
+    const text = inp?.value.trim();
+    if (!text) return;
+    const d = load('sfp_feedback');
+    d.push({ id:genId(), targetId, text, by:currentUser.name, at:todayStr });
+    save('sfp_feedback', d);
+    inp.value = '';
+    // 해당 피드백 영역만 새로고침
+    const area = document.getElementById(`fbArea_${targetId}`);
+    if (area) area.innerHTML = renderFeedbacks(targetId, container);
+}
+
+function delFeedback(id, targetId, container) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_feedback', load('sfp_feedback').filter(f => f.id !== id));
+    const area = document.getElementById(`fbArea_${targetId}`);
+    if (area) area.innerHTML = renderFeedbacks(targetId, container);
+}
+
+// ============================================================
+// 📅 주간요약 (관리자·신인 공통)
+// 이번 주 월~일 기준 팀 활동 요약
+// ============================================================
+function pgWeekly(el) {
+    // 이번 주 월요일 ~ 일요일 계산
+    const now = new Date();
+    const dow = now.getDay(); // 0=일
+    const mon = new Date(now); mon.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
+    const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+    const fmt2 = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const [wStart, wEnd] = [fmt2(mon), fmt2(sun)];
+    const inWeek = date => date >= wStart && date <= wEnd;
+
+    const isAdmin = currentUser.role === 'admin';
+    const acts = load('sfp_activities').filter(a => inWeek(a.date||''));
+    const cons = load('sfp_contracts').filter(c => inWeek(c.date||''));
+    const agrees = load('sfp_consents').filter(c => inWeek(c.date||''));
+    const routes = load('sfp_routes').filter(r => inWeek(r.date||''));
+    const um = uMap();
+    const members = sfpList();
+
+    // 신인이면 본인 데이터만 / 관리자면 현재 존재하는 신인만
+    const validUserIds = new Set(members.map(m => m.id));
+    const myActs   = isAdmin ? acts.filter(a => validUserIds.has(a.userId))   : acts.filter(a => a.userId === currentUser.id);
+    const myCons   = isAdmin ? cons.filter(c => validUserIds.has(c.userId))   : cons.filter(c => c.userId === currentUser.id);
+    const myAgrees = isAdmin ? agrees.filter(c => validUserIds.has(c.userId)) : agrees.filter(c => c.userId === currentUser.id);
+    const myRoutes = isAdmin ? routes.filter(r => validUserIds.has(r.userId)) : routes.filter(r => r.userId === currentUser.id);
+
+    const wLabel = `${mon.getMonth()+1}/${mon.getDate()} (월) ~ ${sun.getMonth()+1}/${sun.getDate()} (일)`;
+
+    // 요일별 활동 수 (막대 시각화)
+    const days = ['월','화','수','목','금','토','일'];
+    const dayCounts = days.map((_, i) => {
+        const d = fmt2(new Date(mon.getTime() + i * 86400000));
+        return myActs.filter(a => a.date === d).length;
+    });
+    const maxCnt = Math.max(...dayCounts, 1);
+
+    const sfpRows = isAdmin ? members.map(m => {
+        const ma = acts.filter(a=>a.userId===m.id).length;
+        const mc = cons.filter(c=>c.userId===m.id).length;
+        const mag = agrees.filter(c=>c.userId===m.id).length;
+        return `<div class="sfp-week-row">
+            <div class="sfp-week-name">
+                <div class="sfp-avatar">${m.name.charAt(0)}</div>${m.name}
+            </div>
+            <div class="sfp-week-nums">
+                <div class="sfp-week-num"><div class="sfp-week-num-v">${ma}</div><div class="sfp-week-num-l">활동</div></div>
+                <div class="sfp-week-num"><div class="sfp-week-num-v">${mc}</div><div class="sfp-week-num-l">계약</div></div>
+                <div class="sfp-week-num"><div class="sfp-week-num-v" style="color:var(--green)">${mag}</div><div class="sfp-week-num-l">동의</div></div>
+            </div>
+        </div>`;
+    }).join('') : '';
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>📅 주간 요약</h2><span style="font-size:12px;color:var(--muted)">${wLabel}</span></div>
+
+    <div class="week-grid">
+        ${[
+            {l:'활동', v:myActs.length, c:'var(--blue)'},
+            {l:'계약', v:myCons.length, c:'var(--gold)'},
+            {l:'동의', v:myAgrees.length, c:'var(--green)'},
+            {l:'동선', v:myRoutes.length, c:'var(--muted)'},
+        ].map(s=>`<div class="week-stat">
+            <div class="week-stat-v" style="color:${s.c}">${s.v}</div>
+            <div class="week-stat-l">${s.l}</div>
+        </div>`).join('')}
+    </div>
+
+    <div class="card">
+        <div class="card-hd">📊 요일별 활동 분포</div>
+        <div style="display:flex;align-items:flex-end;gap:8px;height:80px;padding:0 4px">
+            ${dayCounts.map((cnt, i) => `
+            <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+                <span style="font-size:11px;font-weight:700;color:var(--navy)">${cnt||''}</span>
+                <div style="width:100%;background:${cnt>0?'var(--navy)':'var(--border)'};border-radius:5px 5px 0 0;height:${Math.round((cnt/maxCnt)*56)+4}px;transition:height .4s ease"></div>
+                <span style="font-size:11px;color:var(--muted);font-weight:600">${days[i]}</span>
+            </div>`).join('')}
+        </div>
+    </div>
+
+    ${isAdmin && members.length ? `
+    <div class="card">
+        <div class="card-hd">👥 신인별 이번 주 활동</div>
+        ${sfpRows || '<div class="empty"><div class="empty-ico">👥</div><p>등록된 신인이 없습니다</p></div>'}
+    </div>` : ''}
+
+    ${myActs.length ? `
+    <div class="card">
+        <div class="card-hd">📋 이번 주 활동 목록</div>
+        <div class="tw"><table>
+            <thead><tr><th>날짜</th>${isAdmin?'<th>SFP</th>':''}<th>유형</th><th>고객명</th><th>결과</th></tr></thead>
+            <tbody>${myActs.sort((a,b)=>b.date.localeCompare(a.date)).map(a=>`
+                <tr><td>${a.date}</td>${isAdmin?`<td><strong>${um[a.userId]||'?'}</strong></td>`:''}<td><span class="badge bi">${a.type}</span></td><td>${a.client||'-'}</td><td>${a.result}</td></tr>
+            `).join('')}</tbody>
+        </table></div>
+    </div>` : ''}`;
+}
+
+// ============================================================
+// 💬 월간 1:1 코칭노트 (관리자 전용)
+// 신인별로 월 단위 메모를 남기는 CM 전용 노트
+// 데이터: sfp_coaching = [{id, userId, yearMonth, text, by, at}]
+// ============================================================
+// ============================================================
+// 📋 미팅 체크리스트
+// sfp_checklist = [{id, routeId, userId, date, location,
+//   topics[], duration, nextMeeting, productPT, clientType[], memo}]
+// ============================================================
+let _clRouteId = null;
+
+function openChecklist(routeId, location, date) {
+    _clRouteId = routeId;
+    const existing = load('sfp_checklist').find(c => c.routeId === routeId);
+    document.getElementById('clModalSub').textContent = `${date}  📍 ${location}`;
+    renderChecklistForm(existing);
+    document.getElementById('clModal').classList.add('on');
+}
+
+function openChecklistView(routeId) {
+    const cl = load('sfp_checklist').find(c => c.routeId === routeId);
+    if (!cl) return;
+    _clRouteId = routeId;
+    const r = load('sfp_routes').find(r => r.id === routeId);
+    document.getElementById('clModalSub').textContent = `${cl.date}  📍 ${cl.location}`;
+    renderChecklistForm(cl);
+    document.getElementById('clModal').classList.add('on');
+}
+
+function closeChecklist() {
+    document.getElementById('clModal').classList.remove('on');
+    _clRouteId = null;
+}
+
+function renderChecklistForm(d) {
+    // d = 기존 저장 데이터 (없으면 undefined)
+    const v = (arr, val) => (arr||[]).includes(val) ? 'sel' : '';
+    const vg = (arr, val) => (arr||[]).includes(val) ? 'sel-green' : '';
+    const vr = (arr, val) => (arr||[]).includes(val) ? 'sel-red' : '';
+
+    document.getElementById('clModalBody').innerHTML = `
+    <!-- ① 미팅 주제 -->
+    <div class="cl-section">
+        <div class="cl-section-title">📌 미팅 주제 (복수 선택)</div>
+        <div class="cl-chips" id="clTopics">
+            ${['보장분석','재무설계','은퇴설계','자녀보험','종신보험','건강보험','실손보험','연금보험','변액보험','CI보험','기타'].map(t =>
+                `<div class="cl-chip ${v(d?.topics, t)}" onclick="toggleChip(this,'clTopics')">${t}</div>`
+            ).join('')}
+        </div>
+    </div>
+    <div class="cl-divider"></div>
+
+    <!-- ② 상담 시간 -->
+    <div class="cl-section">
+        <div class="cl-section-title">⏱️ 상담 시간</div>
+        <div class="cl-chips" id="clDuration">
+            ${['15분 미만','30분','45분','1시간','1시간 30분','2시간 이상'].map(t =>
+                `<div class="cl-chip ${d?.duration===t?'sel':''}" onclick="singleChip(this,'clDuration')">${t}</div>`
+            ).join('')}
+        </div>
+    </div>
+    <div class="cl-divider"></div>
+
+    <!-- ③ 2차 미팅 -->
+    <div class="cl-section">
+        <div class="cl-section-title">📅 2차 미팅</div>
+        <div class="cl-chips" id="clNext">
+            <div class="cl-chip ${d?.nextMeeting==='확정'?'sel-green':''}" onclick="singleChip(this,'clNext')">✅ 확정</div>
+            <div class="cl-chip ${d?.nextMeeting==='조정중'?'sel':''}" onclick="singleChip(this,'clNext')">🔄 조정중</div>
+            <div class="cl-chip ${d?.nextMeeting==='거절'?'sel-red':''}" onclick="singleChip(this,'clNext')">❌ 거절</div>
+            <div class="cl-chip ${d?.nextMeeting==='보류'?'':''}" onclick="singleChip(this,'clNext')">⏸️ 보류</div>
+        </div>
+    </div>
+    <div class="cl-divider"></div>
+
+    <!-- ④ 상품 PT -->
+    <div class="cl-section">
+        <div class="cl-section-title">📊 상품 PT 여부</div>
+        <div class="cl-chips" id="clPT">
+            <div class="cl-chip ${d?.productPT==='진행'?'sel-green':''}" onclick="singleChip(this,'clPT')">✅ 진행함</div>
+            <div class="cl-chip ${d?.productPT==='미진행'?'sel':''}" onclick="singleChip(this,'clPT')">➖ 미진행</div>
+            <div class="cl-chip ${d?.productPT==='다음예정'?'':''}" onclick="singleChip(this,'clPT')">📅 다음에 예정</div>
+        </div>
+    </div>
+    <div class="cl-divider"></div>
+
+    <!-- ⑤ 고객 성향 -->
+    <div class="cl-section">
+        <div class="cl-section-title">🧠 고객 성향 (복수 선택)</div>
+        <div class="cl-chips" id="clClient">
+            ${['적극적','소극적','가격 민감','보장 중시','절세 관심','빠른 결정','신중한 편','재방문 가능성 높음','재방문 가능성 낮음','VIP 가망'].map(t =>
+                `<div class="cl-chip ${v(d?.clientType, t)}" onclick="toggleChip(this,'clClient')">${t}</div>`
+            ).join('')}
+        </div>
+    </div>
+    <div class="cl-divider"></div>
+
+    <!-- ⑥ 특이사항 -->
+    <div class="cl-section">
+        <div class="cl-section-title">📝 특이사항</div>
+        <textarea id="clMemo" class="inp" rows="3" placeholder="고객 특이사항, 다음 미팅 준비사항 등 자유롭게 작성...">${d?.memo||''}</textarea>
+    </div>
+
+    <button class="btn btn-p" style="width:100%;justify-content:center" onclick="saveChecklist()">
+        💾 체크리스트 저장
+    </button>`;
+}
+
+// 칩 토글 (복수 선택)
+function toggleChip(el, groupId) {
+    el.classList.toggle('sel');
+}
+// 단일 선택 칩
+function singleChip(el, groupId) {
+    const group = document.getElementById(groupId);
+    group.querySelectorAll('.cl-chip').forEach(c => {
+        c.classList.remove('sel','sel-green','sel-red');
+    });
+    // 어떤 sel 클래스로 표시할지 판단
+    if (el.textContent.includes('확정')||el.textContent.includes('진행함')) el.classList.add('sel-green');
+    else if (el.textContent.includes('거절')) el.classList.add('sel-red');
+    else el.classList.add('sel');
+}
+
+function saveChecklist() {
+    if (!_clRouteId) return;
+    const route = load('sfp_routes').find(r => r.id === _clRouteId);
+
+    // 복수 선택 값 읽기
+    const getChips = id => [...document.getElementById(id).querySelectorAll('.cl-chip.sel,.cl-chip.sel-green,.cl-chip.sel-red')]
+        .map(c => c.textContent.trim().replace(/^[✅❌🔄⏸️📅➖]/,'').trim());
+
+    const topics     = getChips('clTopics');
+    const duration   = getChips('clDuration')[0] || '';
+    const nextMeeting= getChips('clNext')[0] || '';
+    const productPT  = getChips('clPT')[0] || '';
+    const clientType = getChips('clClient');
+    const memo       = document.getElementById('clMemo').value.trim();
+
+    // ① 체크리스트 저장
+    const all = load('sfp_checklist').filter(c => c.routeId !== _clRouteId);
+    all.push({
+        id: genId(), routeId: _clRouteId,
+        userId: route?.userId || currentUser.id,
+        date: route?.date || todayStr,
+        location: route?.location || '',
+        topics, duration, nextMeeting, productPT, clientType, memo
+    });
+    save('sfp_checklist', all);
+
+    // ② 활동기록 자동 생성
+    // 💡 체크리스트 내용을 조합해서 활동기록 메모로 자동 변환
+    // - 이미 같은 routeId로 생성된 활동기록이 있으면 덮어쓰기 (중복 방지)
+    const actMemo = [
+        topics.length   ? `주제: ${topics.join('·')}` : '',
+        duration        ? `상담시간: ${duration}` : '',
+        nextMeeting     ? `2차미팅: ${nextMeeting}` : '',
+        productPT       ? `PT: ${productPT}` : '',
+        clientType.length ? `성향: ${clientType.join('·')}` : '',
+        memo            ? `특이사항: ${memo}` : '',
+    ].filter(Boolean).join(' / ');
+
+    // 결과 매핑: 2차미팅 상태 → 활동 결과
+    const resultMap = { '확정':'재접촉예정', '조정중':'재접촉예정', '거절':'거절', '보류':'보류' };
+    const actResult = resultMap[nextMeeting] || '진행중';
+
+    // 💡 이미 등록 시 생성된 활동기록을 찾아서 메모·결과만 업데이트
+    // 새로 push하지 않아 중복 카운팅 없음
+    const activities = load('sfp_activities');
+    const existing = activities.find(a => a.fromChecklist === _clRouteId);
+    if (existing) {
+        existing.result = actResult;
+        existing.note   = actMemo;
+    } else {
+        // 혹시 활동기록이 없으면 (구버전 데이터 등) 새로 생성
+        activities.push({
+            id: genId(),
+            userId: route?.userId || currentUser.id,
+            date: route?.date || todayStr,
+            type: '미팅',
+            client: route?.client || route?.location || '',
+            result: actResult,
+            note: actMemo,
+            fromChecklist: _clRouteId,
+        });
+    }
+    save('sfp_activities', activities);
+
+    closeChecklist();
+    goTab('my_route');
+    alert('📋 체크리스트 저장 완료\n✅ 활동기록이 업데이트되었습니다');
+}
+
+// 관리자용 체크리스트 결과 뱃지 표시
+function renderChecklistBadge(cl) {
+    if (!cl) return '';
+    const topicHtml = (cl.topics||[]).map(t => `<span class="cl-tag" style="background:var(--blueBg,#E8F0FE);color:var(--blue)">${t}</span>`).join('');
+    const clientHtml= (cl.clientType||[]).map(t => `<span class="cl-tag" style="background:var(--gold-bg);color:var(--gold)">${t}</span>`).join('');
+    const nextColor = cl.nextMeeting==='확정'?'var(--green-l)':cl.nextMeeting==='거절'?'var(--red-l)':'var(--bg)';
+    const nextTColor= cl.nextMeeting==='확정'?'var(--green)':cl.nextMeeting==='거절'?'var(--red)':'var(--sub)';
+    return `<div class="cl-result" style="margin:0 0 10px 0">
+        <div class="cl-result-hd">📋 체크리스트 결과</div>
+        <div style="font-size:12px;display:flex;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+            ${cl.duration?`<span style="color:var(--sub)">⏱️ <strong>${cl.duration}</strong></span>`:''}
+            ${cl.nextMeeting?`<span style="background:${nextColor};color:${nextTColor};padding:2px 8px;border-radius:10px;font-weight:700;font-size:11px">📅 ${cl.nextMeeting}</span>`:''}
+            ${cl.productPT?`<span style="color:var(--sub)">📊 PT: <strong>${cl.productPT}</strong></span>`:''}
+        </div>
+        ${topicHtml ? `<div style="margin-bottom:5px">${topicHtml}</div>` : ''}
+        ${clientHtml ? `<div style="margin-bottom:5px">${clientHtml}</div>` : ''}
+        ${cl.memo?`<div style="font-size:12px;color:var(--sub);margin-top:6px;line-height:1.5">📝 ${cl.memo}</div>`:''}
+    </div>`;
+}
+
+// ============================================================
+// 💬 월간 1:1 코칭 노트 (관리자 전용) — 빠른 코멘트 + 월간 노트 분리
+// ============================================================
+function pgCoaching(el) {
+    const members = sfpList();
+    el.innerHTML = `<div class="sec-hd"><h2>💬 1:1 코칭 노트</h2><span style="font-size:12px;color:var(--muted)">CM 전용 · 신인에게 비공개</span></div>`;
+    if (!members.length) {
+        el.innerHTML += `<div class="card"><div class="empty"><div class="empty-ico">🌱</div><p>가입된 신인이 없습니다</p></div></div>`;
+        return;
+    }
+    members.forEach(m => {
+        const div = document.createElement('div');
+        div.className = 'coaching-card';
+        div.id = `coaching_${m.id}`;
+        div.innerHTML = `
+            <div class="coaching-hd">
+                <div class="coaching-avatar">${m.name.charAt(0)}</div>
+                <div>
+                    <div class="coaching-name">${m.name}</div>
+                    <div class="coaching-join">가입일 ${m.joinDate||'-'} · 월 목표 ${m.target}건</div>
+                </div>
+            </div>
+            <!-- 탭 -->
+            <div class="coaching-tabs">
+                <button class="coaching-tab on" onclick="switchCoachingTab('${m.id}','quick',this)">💬 빠른 코멘트</button>
+                <button class="coaching-tab" onclick="switchCoachingTab('${m.id}','monthly',this)">📅 월간 노트</button>
+            </div>
+            <!-- 빠른 코멘트 패널 -->
+            <div id="cp_quick_${m.id}">
+                ${renderQuickComments(m.id)}
+                <div class="qc-form">
+                    <input class="qc-inp" id="qci_${m.id}" placeholder="오늘 코칭 한 마디..." onkeydown="if(event.key==='Enter') addQuickComment('${m.id}')">
+                    <button class="btn btn-p btn-sm" onclick="addQuickComment('${m.id}')">등록</button>
+                </div>
+            </div>
+            <!-- 월간 노트 패널 -->
+            <div id="cp_monthly_${m.id}" style="display:none">
+                <div id="notes_${m.id}">${renderNotes(m.id)}</div>
+                <div class="note-add-form">
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <input type="month" id="nm_${m.id}" class="inp" value="${thisYM}" style="max-width:148px">
+                        <span style="font-size:12px;color:var(--muted)">월 종합 코칭 노트</span>
+                    </div>
+                    <textarea id="nt_${m.id}" class="inp" rows="3" placeholder="이번 달 종합 코칭 내용, 목표 리뷰, 개선점..."></textarea>
+                    <div><button class="btn btn-p btn-sm" onclick="addCoachingNote('${m.id}')">💾 노트 저장</button></div>
+                </div>
+            </div>`;
+        el.appendChild(div);
+    });
+}
+
+function switchCoachingTab(userId, tab, btn) {
+    document.getElementById(`cp_quick_${userId}`).style.display   = tab==='quick'   ? 'block' : 'none';
+    document.getElementById(`cp_monthly_${userId}`).style.display = tab==='monthly' ? 'block' : 'none';
+    btn.closest('.coaching-tabs').querySelectorAll('.coaching-tab').forEach(b => b.classList.remove('on'));
+    btn.classList.add('on');
+}
+
+// 빠른 코멘트
+function renderQuickComments(userId) {
+    const comments = load('sfp_quick_comments')
+        .filter(c => c.userId === userId)
+        .sort((a,b) => b.at.localeCompare(a.at))
+        .slice(0, 10); // 최근 10개
+    if (!comments.length) return `<div style="font-size:13px;color:var(--muted);padding:8px 0 12px">아직 코멘트가 없습니다.</div>`;
+    return `<div style="margin-bottom:8px">${comments.map(c => `
+        <div class="quick-comment">
+            <div class="qc-meta">
+                <span>👑 ${c.by}</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                    <span>${c.at}</span>
+                    <button class="qc-del" onclick="delQuickComment('${c.id}','${userId}')">×</button>
+                </div>
+            </div>
+            <div class="qc-text">${c.text}</div>
+        </div>`).join('')}</div>`;
+}
+
+function addQuickComment(userId) {
+    const inp  = document.getElementById(`qci_${userId}`);
+    const text = inp?.value.trim();
+    if (!text) return;
+    const d = load('sfp_quick_comments');
+    d.push({ id:genId(), userId, text, by:currentUser.name, at:todayStr });
+    save('sfp_quick_comments', d);
+    inp.value = '';
+    document.getElementById(`cp_quick_${userId}`).innerHTML =
+        renderQuickComments(userId) +
+        `<div class="qc-form">
+            <input class="qc-inp" id="qci_${userId}" placeholder="오늘 코칭 한 마디..." onkeydown="if(event.key==='Enter') addQuickComment('${userId}')">
+            <button class="btn btn-p btn-sm" onclick="addQuickComment('${userId}')">등록</button>
+        </div>`;
+}
+
+function delQuickComment(id, userId) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_quick_comments', load('sfp_quick_comments').filter(c => c.id !== id));
+    document.getElementById(`cp_quick_${userId}`).innerHTML =
+        renderQuickComments(userId) +
+        `<div class="qc-form">
+            <input class="qc-inp" id="qci_${userId}" placeholder="오늘 코칭 한 마디..." onkeydown="if(event.key==='Enter') addQuickComment('${userId}')">
+            <button class="btn btn-p btn-sm" onclick="addQuickComment('${userId}')">등록</button>
+        </div>`;
+}
+
+// 월간 노트 (기존 유지)
+function renderNotes(userId) {
+    const notes = load('sfp_coaching').filter(n => n.userId === userId).sort((a,b) => b.yearMonth.localeCompare(a.yearMonth));
+    if (!notes.length) return `<div style="font-size:13px;color:var(--muted);padding:8px 0">아직 작성된 노트가 없습니다.</div>`;
+    return notes.map(n => `
+        <div class="note-item">
+            <div class="note-item-hd">
+                <span class="note-month">${n.yearMonth}</span>
+                <button onclick="delCoachingNote('${n.id}','${userId}')" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;padding:0">×</button>
+            </div>
+            <div class="note-text">${n.text}</div>
+            <div style="font-size:10.5px;color:var(--dimmed);margin-top:6px">${n.by} · ${n.at}</div>
+        </div>`).join('');
+}
+
+function addCoachingNote(userId) {
+    const ym = document.getElementById(`nm_${userId}`)?.value;
+    const text = document.getElementById(`nt_${userId}`)?.value.trim();
+    if (!ym || !text) return alert('월과 내용을 입력해주세요');
+    const d = load('sfp_coaching');
+    d.push({ id:genId(), userId, yearMonth:ym, text, by:currentUser.name, at:todayStr });
+    save('sfp_coaching', d);
+    document.getElementById(`nt_${userId}`).value = '';
+    document.getElementById(`notes_${userId}`).innerHTML = renderNotes(userId);
+}
+
+function delCoachingNote(id, userId) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    save('sfp_coaching', load('sfp_coaching').filter(n => n.id !== id));
+    document.getElementById(`notes_${userId}`).innerHTML = renderNotes(userId);
+}
+
+
+
+
+function pgMaterials(el) {
+    el.innerHTML = `
+    <div class="sec-hd"><h2>자료실</h2></div>
+    <div class="card" style="text-align:center;padding:30px">
+        <div style="font-size:13px;color:var(--muted)">자료 불러오는 중...</div>
+    </div>`;
+    window._fsLoad('sfp_promos').then(() => {
+        el.innerHTML = `
+        <div class="sec-hd"><h2>자료실</h2></div>
+        <div class="card">
+            <div class="card-hd">📚 장표 / 프로모션 자료</div>
+            <div id="promoGridArea"></div>
+        </div>`;
+        renderPromoGrid(false);
+    });
+}
+
+// ============================================================
+// 🚀 앱 시작
+// ============================================================
+function startApp() {
+    initApp();
+}
+// _onFirebaseReady는 Firebase 초기화 완료 시 호출됨
+window._onFirebaseReady = startApp;
+</script>
+</body>
+</html>
