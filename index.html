@@ -3005,8 +3005,15 @@ function addRoute() {
 
 function delMyRoute(id) {
     if (!confirm('삭제하시겠습니까?')) return;
-    save('sfp_routes', load('sfp_routes').filter(r=>r.id!==id));
-    goTab('my_route');
+    // sfp_routes 삭제
+    const routes = load('sfp_routes').filter(r => r.id !== id);
+    save('sfp_routes', routes);
+    // 연결된 sfp_activities도 같이 삭제 (fromChecklist === id)
+    const acts = load('sfp_activities').filter(a => a.fromChecklist !== id);
+    save('sfp_activities', acts);
+    // 현재 탭 그대로 새로고침
+    const curTab = window._currentTabId || 'my_route';
+    goTab(curTab);
 }
 
 
