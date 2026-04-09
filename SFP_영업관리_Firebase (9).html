@@ -98,8 +98,10 @@
                 if (window._currentTabId && window._pageMap) {
                     const fn = window._pageMap[window._currentTabId];
                     const main = document.getElementById('appMain');
-                    if (fn && main && main.firstChild) {
-                        fn(main.firstChild);
+                    // firstChild가 텍스트 노드일 수 있으므로 firstElementChild 사용
+                    const contentEl = main && (main.firstElementChild || main.firstChild);
+                    if (fn && contentEl) {
+                        fn(contentEl);
                     }
                 }
             } else {
@@ -1260,7 +1262,8 @@ const SFP_TABS = [
     { id:'my_stats',    label:'📊 내 실적' },
     { id:'weekly',      label:'📅 주간요약' },
     { id:'calendar',    label:'🗓️ 달력' },
-    { id:'my_route',    label:'🗺️ 오늘일정' },
+    { id:'my_route',    label:'🗺️ 일정관리' },
+    { id:'my_clients',  label:'👤 고객관리' },
     { id:'my_consent',  label:'✅ 동의입력' },
     { id:'my_contract', label:'📝 계약입력' },
     { id:'my_message',  label:'✉️ 쪽지' },
@@ -1294,7 +1297,7 @@ function goTab(id) {
         notices: pgNotices,     messages: pgMessages,
         my_stats: pgMyStats,    my_consent: pgMyConsent,
         my_activity: pgMyActivity, my_contract: pgMyContract,
-        my_message: pgMyMessage,
+        my_message: pgMyMessage,   my_clients: pgMyClients,
         materials: pgMaterials, my_route: pgMyRoute
     };
     window._pageMap = pages; // 실시간 리스너가 현재 탭 새로고침에 사용
@@ -2287,7 +2290,8 @@ function pgMyStats(el) {
     const freshMe   = load('sfp_users').find(u => u.id === me.id) || me;
     const mc        = load('sfp_contracts').filter(c=>c.userId===me.id&&c.date?.startsWith(thisYM));
     const ms        = load('sfp_consents').filter(c=>c.userId===me.id&&c.date?.startsWith(thisYM));
-    const meetings  = load('sfp_routes').filter(r=>r.userId===me.id&&r.rtype==='고객미팅'&&r.date?.startsWith(thisYM));
+    // 고객미팅 카운팅 → sfp_activities 기준 (관리자 삭제 시 즉시 반영)
+    const meetings  = load('sfp_activities').filter(r=>r.userId===me.id&&r.date?.startsWith(thisYM));
     const totalTp   = mc.reduce((s,c)=>s+(c.tp||0),0);
     const pm        = mc.reduce((s,c)=>s+(c.premium||0),0);
 
@@ -2832,6 +2836,7 @@ function pgMyRoute(el) {
 }
 
 function renderMyRoute(el, selectedDate) {
+    el.setAttribute('data-route-date', selectedDate);
     el.dataset.routeDate = selectedDate;
     const myRoutes = load('sfp_routes')
         .filter(r => r.userId === currentUser.id && r.date === selectedDate)
@@ -2851,7 +2856,7 @@ function renderMyRoute(el, selectedDate) {
         <div class="card-hd">➕ 일정 추가</div>
         <div class="grid2">
             <div class="fg"><label class="lbl">날짜 *</label><input type="date" id="rtDate" class="inp" value="${selectedDate}"
-                onchange="renderMyRoute(this.closest('[data-route-date]')||document.getElementById('appMain').firstChild, this.value)"></div>
+                onchange="changeRouteDate(this.value)"></div>
             <div class="fg"><label class="lbl">시간 *</label><input type="time" id="rtTime" class="inp"></div>
             <div class="fg">
                 <label class="lbl">유형 *</label>
@@ -2873,13 +2878,13 @@ function renderMyRoute(el, selectedDate) {
         <button class="btn btn-p" onclick="addRoute()">+ 추가</button>
     </div>
 
-    <!-- 날짜 이동 -->
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
-        <button class="btn btn-o btn-sm" onclick="moveRouteDate(-1)">◀ 전날</button>
-        <div style="flex:1;text-align:center;font-size:14px;font-weight:700;color:var(--ink)">
-            ${selectedDate === todayStr ? '📍 오늘 ' : ''}${selectedDate}
+    <!-- 날짜 이동 바 -->
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;background:#fff;border-radius:var(--r-sm);padding:10px 14px;box-shadow:var(--sh-sm)">
+        <button class="btn btn-o btn-sm" style="flex-shrink:0" onclick="moveRouteDate(-1)">◀ 전날</button>
+        <div style="flex:1;text-align:center;font-size:14px;font-weight:800;color:var(--ink)">
+            ${selectedDate === todayStr ? `<span style="color:var(--gold)">오늘</span> ` : ''}${selectedDate}
         </div>
-        <button class="btn btn-o btn-sm" onclick="moveRouteDate(1)">다음날 ▶</button>
+        <button class="btn btn-o btn-sm" style="flex-shrink:0" onclick="moveRouteDate(1)">다음날 ▶</button>
     </div>
 
     <div class="card">
@@ -2910,12 +2915,40 @@ function renderMyRoute(el, selectedDate) {
                 </div>
             </div>`;
         }).join('')
-        : `<div class="empty"><div class="empty-ico">🗺️</div><div>${selectedDate} 등록된 일정이 없습니다</div></div>`}
-    </div>`;
+        : `<div class="empty"><div class="empty-ico">🗺️</div><div>${selectedDate} 등록된 일정이 없습니다<br><span style="font-size:11px;color:var(--muted)">위에서 날짜를 선택하거나 ◀▶ 버튼으로 이동하세요</span></div></div>`}
+    </div>
+
+    <!-- 해당 날짜 활동 목록 -->
+    ${(() => {
+        const dayActs = load('sfp_activities')
+            .filter(a => a.userId === currentUser.id && a.date === selectedDate)
+            .sort((a,b) => (a.client||'').localeCompare(b.client||''));
+        if (!dayActs.length) return '';
+        const rb = {'계약완료':'bs','진행중':'bi','거절':'bd','보류':'bw','재접촉예정':'bn'};
+        return `<div class="card">
+            <div class="card-hd">📋 ${selectedDate} 활동 기록 (${dayActs.length}건)</div>
+            ${dayActs.map(a => `
+            <div style="padding:10px 12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--border);margin-bottom:8px;display:flex;align-items:center;gap:10px">
+                <div style="flex:1;min-width:0">
+                    <div style="font-size:13px;font-weight:700;color:var(--ink)">${a.client||'-'}</div>
+                    <div style="font-size:11px;color:var(--muted);margin-top:2px">${a.note||''}</div>
+                </div>
+                <span class="badge ${rb[a.result]||'bg_'}" style="font-size:10px;flex-shrink:0">${a.result}</span>
+            </div>`).join('')}
+        </div>`;
+    })()}`;
+}
+
+function changeRouteDate(newDate) {
+    // appMain 안에서 data-route-date 속성 가진 요소 찾기
+    const main = document.getElementById('appMain');
+    const el = main && (main.querySelector('[data-route-date]') || main.firstElementChild);
+    if (el) renderMyRoute(el, newDate);
 }
 
 function moveRouteDate(dir) {
-    const el = document.getElementById('appMain').firstChild;
+    const main = document.getElementById('appMain');
+    const el = main && (main.querySelector('[data-route-date]') || main.firstElementChild);
     if (!el) return;
     const cur = new Date(el.dataset.routeDate || todayStr);
     cur.setDate(cur.getDate() + dir);
@@ -3123,6 +3156,115 @@ function deleteNotice(id) {
 // ============================================================
 
 // 신인 → 쪽지 보내기 & 내 쪽지함
+// ============================================================
+// 👤 신인 고객관리 탭
+// 날짜별 고객미팅 목록 + 체크리스트 미작성 건 바로 작성 가능
+// ============================================================
+function pgMyClients(el) {
+    const selYM = el.dataset.clientYM || thisYM;
+    renderMyClients(el, selYM);
+}
+
+function renderMyClients(el, ym) {
+    el.dataset.clientYM = ym;
+    const [ymYear, ymMon] = ym.split('-').map(Number);
+
+    // 이 달 활동 기록 (본인 것만)
+    const acts = load('sfp_activities')
+        .filter(a => a.userId === currentUser.id && a.date?.startsWith(ym))
+        .sort((a,b) => b.date.localeCompare(a.date));
+
+    const checklists = load('sfp_checklist');
+    const rb = {'계약완료':'bs','진행중':'bi','거절':'bd','보류':'bw','재접촉예정':'bn'};
+
+    // 날짜별 그룹핑
+    const byDate = {};
+    acts.forEach(a => {
+        if (!byDate[a.date]) byDate[a.date] = [];
+        byDate[a.date].push(a);
+    });
+    const dates = Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+
+    // 월 선택 목록 (최근 6개월)
+    const months = Array.from({length:6}, (_,i) => {
+        const d = new Date(today.getFullYear(), today.getMonth()-i, 1);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    });
+
+    const totalActs = acts.length;
+    const doneChk = acts.filter(a => checklists.find(c => c.fromChecklist === a.fromChecklist || c.routeId === a.fromChecklist)).length;
+    const pendingChk = totalActs - doneChk;
+
+    el.innerHTML = `
+    <div class="sec-hd"><h2>👤 고객관리</h2>
+        <select class="inp" style="font-size:12px;padding:5px 10px;height:auto;width:auto"
+            onchange="renderMyClients(this.closest('[data-client-y-m]')||document.getElementById('appMain').firstElementChild, this.value)">
+            ${months.map(m=>`<option value="${m}" ${m===ym?'selected':''}>${m.replace('-','년 ')}월</option>`).join('')}
+        </select>
+    </div>
+
+    <!-- 요약 카드 -->
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px">
+        <div style="background:#fff;border:1px solid var(--border);border-radius:var(--r-sm);padding:14px;text-align:center;box-shadow:var(--sh-sm)">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:5px">총 활동</div>
+            <div style="font-size:22px;font-weight:900;color:var(--blue)">${totalActs}건</div>
+        </div>
+        <div style="background:#fff;border:1px solid var(--border);border-radius:var(--r-sm);padding:14px;text-align:center;box-shadow:var(--sh-sm)">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:5px">체크리스트 완료</div>
+            <div style="font-size:22px;font-weight:900;color:var(--green)">${doneChk}건</div>
+        </div>
+        <div style="background:#fff;border:1px solid ${pendingChk>0?'#FCA5A5':'var(--border)'};border-radius:var(--r-sm);padding:14px;text-align:center;box-shadow:var(--sh-sm);background:${pendingChk>0?'#FEF2F2':'#fff'}">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:5px">미작성</div>
+            <div style="font-size:22px;font-weight:900;color:${pendingChk>0?'var(--red)':'var(--muted)'}">${pendingChk}건</div>
+        </div>
+    </div>
+
+    <!-- 날짜별 목록 -->
+    ${dates.length ? dates.map(date => {
+        const dayActs = byDate[date];
+        const [y,mo,d] = date.split('-');
+        const dayNames = ['일','월','화','수','목','금','토'];
+        const dayName = dayNames[new Date(parseInt(y),parseInt(mo)-1,parseInt(d)).getDay()];
+        return `
+        <div class="card" style="margin-bottom:12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                <div style="font-size:13px;font-weight:800;color:var(--ink)">${parseInt(mo)}월 ${parseInt(d)}일 (${dayName})</div>
+                <div style="font-size:11px;color:var(--muted)">${dayActs.length}건</div>
+            </div>
+            ${dayActs.map(a => {
+                // 체크리스트 연결 - fromChecklist 키로 sfp_routes 찾아서 체크리스트 확인
+                const routeId = a.fromChecklist;
+                const cl = routeId ? checklists.find(c => c.routeId === routeId) : null;
+                return `
+                <div style="padding:12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid ${!cl?'#FCA5A5':'var(--border)'};margin-bottom:8px">
+                    <div style="display:flex;align-items:flex-start;gap:10px">
+                        <div style="flex:1;min-width:0">
+                            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+                                <span style="font-size:13px;font-weight:700;color:var(--ink)">👤 ${a.client||'-'}</span>
+                                <span class="badge ${rb[a.result]||'bg_'}" style="font-size:10px">${a.result}</span>
+                            </div>
+                            ${a.note?`<div style="font-size:11px;color:var(--muted);margin-bottom:6px">${a.note}</div>`:''}
+                            <div style="display:flex;align-items:center;gap:6px">
+                                ${cl
+                                    ? `<span style="font-size:11px;color:var(--green);font-weight:700">✅ 체크리스트 완료</span>`
+                                    : `<span style="font-size:11px;color:var(--red);font-weight:700">⚠️ 체크리스트 미작성</span>`}
+                            </div>
+                        </div>
+                        <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
+                            ${routeId ? `
+                            <button class="btn btn-sm ${cl?'btn-g':'btn-o'}" style="font-size:11px;padding:5px 10px"
+                                onclick="openChecklist('${routeId}','${(a.client||'').replace(/'/g,"\\'")}','${a.date}')">
+                                📋 ${cl?'수정':'작성'}
+                            </button>` : ''}
+                        </div>
+                    </div>
+                </div>`;
+            }).join('')}
+        </div>`;
+    }).join('')
+    : `<div class="empty"><div class="empty-ico">👤</div><div>${ymYear}년 ${ymMon}월 고객 활동 기록이 없습니다</div></div>`}`;
+}
+
 function pgMyMessage(el) {
     const myMsgs = load('sfp_messages')
         .filter(m => m.fromId === currentUser.id)
@@ -3326,11 +3468,12 @@ function pgWeekly(el) {
     const um = uMap();
     const members = sfpList();
 
-    // 신인이면 본인 데이터만
-    const myActs   = isAdmin ? acts   : acts.filter(a => a.userId === currentUser.id);
-    const myCons   = isAdmin ? cons   : cons.filter(c => c.userId === currentUser.id);
-    const myAgrees = isAdmin ? agrees : agrees.filter(c => c.userId === currentUser.id);
-    const myRoutes = isAdmin ? routes : routes.filter(r => r.userId === currentUser.id);
+    // 신인이면 본인 데이터만 / 관리자면 현재 존재하는 신인만
+    const validUserIds = new Set(members.map(m => m.id));
+    const myActs   = isAdmin ? acts.filter(a => validUserIds.has(a.userId))   : acts.filter(a => a.userId === currentUser.id);
+    const myCons   = isAdmin ? cons.filter(c => validUserIds.has(c.userId))   : cons.filter(c => c.userId === currentUser.id);
+    const myAgrees = isAdmin ? agrees.filter(c => validUserIds.has(c.userId)) : agrees.filter(c => c.userId === currentUser.id);
+    const myRoutes = isAdmin ? routes.filter(r => validUserIds.has(r.userId)) : routes.filter(r => r.userId === currentUser.id);
 
     const wLabel = `${mon.getMonth()+1}/${mon.getDate()} (월) ~ ${sun.getMonth()+1}/${sun.getDate()} (일)`;
 
