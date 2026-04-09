@@ -3263,6 +3263,10 @@ function renderMyClients(el, ym) {
                                 onclick="openChecklist('${routeId}','${(a.client||'').replace(/'/g,"\\'")}','${a.date}')">
                                 📋 ${cl?'수정':'작성'}
                             </button>` : ''}
+                            <button class="btn btn-d btn-sm" style="font-size:11px;padding:5px 10px"
+                                onclick="delFromClients('${a.id}','${routeId||''}')">
+                                삭제
+                            </button>
                         </div>
                     </div>
                 </div>`;
@@ -3270,6 +3274,18 @@ function renderMyClients(el, ym) {
         </div>`;
     }).join('')
     : `<div class="empty"><div class="empty-ico">👤</div><div>${ymYear}년 ${ymMon}월 고객 활동 기록이 없습니다</div></div>`}`;
+}
+
+// 고객관리 탭에서 삭제 (sfp_activities + sfp_routes 동시 삭제)
+function delFromClients(actId, routeId) {
+    if (!confirm('삭제하시겠습니까?')) return;
+    // 활동기록 삭제
+    save('sfp_activities', load('sfp_activities').filter(a => a.id !== actId));
+    // 연결된 일정(routes) 삭제
+    if (routeId) {
+        save('sfp_routes', load('sfp_routes').filter(r => r.id !== routeId));
+    }
+    goTab('my_clients');
 }
 
 function pgMyMessage(el) {
