@@ -61,6 +61,14 @@
         // 캐시 즉시 업데이트 (화면 반영용)
         window._cache[col] = arr;
 
+        // 로컬 저장 ID 추적 (리스너에서 본인 저장 구분용)
+        if (!window._localSaveIds) window._localSaveIds = new Set();
+        arr.forEach(item => { if (item.id) window._localSaveIds.add(String(item.id)); });
+        // 5초 후 추적 ID 초기화 (오래된 것 정리)
+        setTimeout(() => {
+            if (window._localSaveIds) window._localSaveIds.clear();
+        }, 5000);
+
         const batch = db.batch();
         let batchCount = 0;
         arr.forEach(item => {
@@ -69,7 +77,6 @@
             batch.set(ref, item);
             batchCount++;
         });
-        // 삭제된 레코드 처리는 delRec에서 직접 처리하므로 여기선 생략
         if (batchCount > 0) {
             batch.commit().catch(e => console.warn('Firestore batch error:', e));
         }
@@ -92,19 +99,27 @@
 
             if (!window._loggedIn) return;
 
-            // 신인: 자동 재렌더링 (관리자가 수정/삭제해도 바로 반영)
-            // 관리자: 배지만 표시 (자동 재렌더링 시 입력 중이던 폼 초기화 방지)
+            // 변경이 현재 기기에서 발생한 건지 확인 (본인 저장은 재렌더링 안 함)
+            const isLocalChange = snap.docChanges().every(ch =>
+                window._localSaveIds && window._localSaveIds.has(ch.doc.id)
+            );
+            if (isLocalChange) {
+                // 본인이 저장한 건 캐시만 업데이트, 폼 재렌더링 안 함
+                return;
+            }
+
+            // 신인: 관리자가 수정/삭제한 경우만 자동 재렌더링
             if (currentUser && currentUser.role === 'sfp') {
                 if (window._currentTabId && window._pageMap) {
                     const fn = window._pageMap[window._currentTabId];
                     const main = document.getElementById('appMain');
-                    // firstChild가 텍스트 노드일 수 있으므로 firstElementChild 사용
                     const contentEl = main && (main.firstElementChild || main.firstChild);
                     if (fn && contentEl) {
                         fn(contentEl);
                     }
                 }
             } else {
+                // 관리자: 신인이 데이터 등록하면 🔴 배지 표시
                 if (window._newDataKeys) window._newDataKeys.add(col);
                 updateRefreshBadge();
             }
